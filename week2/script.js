@@ -1,3 +1,9 @@
+// script.js — Content-based movie recommender (Cosine similarity, vanilla JS)
+
+// ============================
+// App bootstrap
+// ============================
+
 // Initialize the application when the window loads
 window.onload = async function() {
     try {
@@ -6,7 +12,7 @@ window.onload = async function() {
         resultElement.textContent = "Loading movie data...";
         resultElement.className = 'loading';
         
-        // Load data
+        // Load data (defined in data.js)
         await loadData();
         
         // Populate dropdown and update status
@@ -15,9 +21,13 @@ window.onload = async function() {
         resultElement.className = 'success';
     } catch (error) {
         console.error('Initialization error:', error);
-        // Error message already set in data.js
+        // Error message already set in data.js (if loadData throws)
     }
 };
+
+// ============================
+// UI helpers
+// ============================
 
 // Populate the movies dropdown with sorted movie titles
 function populateMoviesDropdown() {
@@ -40,7 +50,44 @@ function populateMoviesDropdown() {
     });
 }
 
-// Main recommendation function
+// ============================
+// Similarity utilities (Cosine)
+// ============================
+
+// Cache for genre sets to avoid recreating Set objects repeatedly
+const genreSetCache = new Map();
+
+function getGenreSet(movie) {
+    let set = genreSetCache.get(movie.id);
+    if (!set) {
+        set = new Set(movie.genres || []);
+        genreSetCache.set(movie.id, set);
+    }
+    return set;
+}
+
+// Cosine similarity for binary genre vectors:
+// cos = |A ∩ B| / (sqrt(|A|) * sqrt(|B|))
+function cosineSimilarityGenres(setA, setB) {
+    const sizeA = setA.size;
+    const sizeB = setB.size;
+    if (sizeA === 0 || sizeB === 0) return 0;
+
+    let intersectionCount = 0;
+    // Iterate through the smaller set for efficiency
+    const [small, large] = sizeA < sizeB ? [setA, setB] : [setB, setA];
+    for (const g of small) {
+        if (large.has(g)) intersectionCount++;
+    }
+
+    const denom = Math.sqrt(sizeA) * Math.sqrt(sizeB);
+    return denom > 0 ? intersectionCount / denom : 0;
+}
+
+// ============================
+// Core: recommendations flow
+// ============================
+
 function getRecommendations() {
     const resultElement = document.getElementById('result');
     
@@ -64,50 +111,40 @@ function getRecommendations() {
         }
         
         // Show loading message while processing
-        resultElement.textContent = "Calculating recommendations...";
+        resultElement.textContent = "Calculating recommendations (cosine similarity)...";
         resultElement.className = 'loading';
         
         // Use setTimeout to allow the UI to update before heavy computation
         setTimeout(() => {
             try {
                 // Step 3: Prepare for similarity calculation
-                const likedGenres = new Set(likedMovie.genres);
+                const likedGenres = getGenreSet(likedMovie);
                 const candidateMovies = movies.filter(movie => movie.id !== likedMovie.id);
                 
-                // Step 4: Calculate Jaccard similarity scores
+                // Step 4: Calculate Cosine similarity scores (instead of Jaccard)
                 const scoredMovies = candidateMovies.map(candidate => {
-                    const candidateGenres = new Set(candidate.genres);
-                    
-                    // Calculate intersection
-                    const intersection = new Set(
-                        [...likedGenres].filter(genre => candidateGenres.has(genre))
-                    );
-                    
-                    // Calculate union
-                    const union = new Set([...likedGenres, ...candidateGenres]);
-                    
-                    // Calculate Jaccard similarity
-                    const score = union.size > 0 ? intersection.size / union.size : 0;
-                    
-                    return {
-                        ...candidate,
-                        score: score
-                    };
+                    const candidateGenres = getGenreSet(candidate);
+                    const score = cosineSimilarityGenres(likedGenres, candidateGenres);
+                    return { ...candidate, score };
                 });
                 
-                // Step 5: Sort by score in descending order
-                scoredMovies.sort((a, b) => b.score - a.score);
+                // Step 5: Sort by score in descending order; tie-breaker by title for stability
+                scoredMovies.sort((a, b) => {
+                    if (b.score !== a.score) return b.score - a.score;
+                    return a.title.localeCompare(b.title);
+                });
                 
                 // Step 6: Select top recommendations
-                const topRecommendations = scoredMovies.slice(0, 2);
+                const TOP_K = 2;
+                const topRecommendations = scoredMovies.slice(0, TOP_K);
                 
                 // Step 7: Display results
-                if (topRecommendations.length > 0) {
+                if (topRecommendations.length > 0 && topRecommendations[0].score > 0) {
                     const recommendationTitles = topRecommendations.map(movie => movie.title);
                     resultElement.textContent = `Because you liked "${likedMovie.title}", we recommend: ${recommendationTitles.join(', ')}`;
                     resultElement.className = 'success';
                 } else {
-                    resultElement.textContent = `No recommendations found for "${likedMovie.title}".`;
+                    resultElement.textContent = `No strong cosine-based matches found for "${likedMovie.title}".`;
                     resultElement.className = 'error';
                 }
             } catch (error) {
