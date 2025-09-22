@@ -17,7 +17,7 @@ window.onload = async function() {
         
         // Populate dropdown and update status
         populateMoviesDropdown();
-        resultElement.textContent = "Data loaded. Please select a movie2.";
+        resultElement.textContent = "Data loaded. Please select a movie - cosine similairy will find recs.";
         resultElement.className = 'success';
     } catch (error) {
         console.error('Initialization error:', error);
