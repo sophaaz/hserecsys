@@ -1,0 +1,149 @@
+/* style.css */
+/* =============================
+   Apple-like Dark UI Theme
+   Minimal, accessible, responsive
+   ============================= */
+
+:root{
+  --bg: #000;
+  --surface: #1c1c1e;
+  --surface-2: #2c2c2e;
+  --text: #f5f5f7;
+  --muted: #a1a1a6;
+  --brand: #0a84ff;
+  --brand-2: #0a7bff;
+  --border: rgba(255,255,255,0.10);
+  --shadow: 0 10px 30px rgba(0,0,0,0.6);
+  --success: #30d158;
+  --error: #ff453a;
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  -webkit-font-smoothing:antialiased;
+  background:var(--bg);
+  color:var(--text);
+  display:flex;
+  justify-content:center;
+  align-items:flex-start;
+  padding:24px;
+}
+
+.container{
+  width:min(960px,94vw);
+}
+
+header{margin-bottom:16px}
+h1{
+  font-size:clamp(20px,2.4vw,28px);
+  font-weight:700;
+  letter-spacing:-0.02em;
+  text-align:center;
+}
+#app-desc{
+  color:var(--muted);
+  text-align:center;
+  margin-top:6px;
+  margin-bottom:14px;
+  font-size:14px;
+}
+
+.card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:16px;
+  box-shadow:var(--shadow);
+  padding:18px;
+  margin-bottom:16px;
+}
+
+.row{display:flex;align-items:center}
+.space-between{justify-content:space-between}
+.gap{gap:10px}
+
+.grid-5,.grid-3{
+  display:grid;
+  gap:12px;
+}
+.grid-5{grid-template-columns:repeat(5,1fr)}
+.grid-3{grid-template-columns:2fr 1fr 1fr}
+@media (max-width:760px){
+  .grid-5,.grid-3{grid-template-columns:1fr}
+}
+
+.field label{
+  display:block;color:var(--muted);font-size:12px;margin-bottom:6px
+}
+.field input,.field select{
+  width:100%;
+  padding:11px 12px;
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:var(--surface-2);
+  color:var(--text);
+  outline:none;
+  transition:border-color .2s, box-shadow .2s;
+  -webkit-appearance:none;appearance:none;
+}
+.field input:focus,.field select:focus{
+  border-color:var(--brand);
+  box-shadow:0 0 0 3px rgba(10,132,255,.35);
+}
+.align-end{display:flex;align-items:end}
+
+.btn{
+  padding:11px 16px;border-radius:12px;border:1px solid var(--border);
+  background:var(--surface-2);color:var(--text);cursor:pointer;
+  transition:transform .06s, box-shadow .2s, background-color .2s;
+}
+.btn:hover{background:#3a3a3c}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--brand);border-color:transparent;box-shadow:0 8px 20px rgba(10,132,255,.25)}
+.btn.primary:hover{background:var(--brand-2)}
+
+.muted{color:var(--muted)}
+.small{font-size:12px}
+
+.stats{display:flex;gap:16px;margin-top:10px;flex-wrap:wrap}
+.stat{
+  background:var(--surface-2);
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:10px 12px;
+  min-width:110px;
+  display:flex;flex-direction:column;align-items:center
+}
+.stat span{font-size:18px;font-weight:700}
+.stat label{font-size:12px;color:var(--muted);margin-top:4px}
+
+.progress-wrap{margin-top:12px}
+.progress{
+  width:100%;height:10px;border-radius:999px;background:#2e2e2e;overflow:hidden;border:1px solid var(--border)
+}
+.progress .bar{height:100%;width:0;background:var(--brand);transition:width .2s}
+
+.progress-info{
+  display:flex;gap:12px;flex-wrap:wrap;
+  margin-top:8px;font-size:13px;color:var(--muted)
+}
+
+.table-wrap{margin-top:10px;overflow:auto;border-radius:12px;border:1px solid var(--border)}
+table{width:100%;border-collapse:separate;border-spacing:0}
+thead th{
+  position:sticky;top:0;background:var(--surface);z-index:1;
+  text-align:left;padding:10px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--muted)
+}
+tbody td{
+  padding:10px;border-bottom:1px solid var(--border);vertical-align:top;font-size:14px
+}
+tbody tr:hover{background:rgba(255,255,255,0.03)}
+
+.status-ok{color:var(--success)}
+.status-err{color:var(--error)}
+
+footer{margin-top:10px;text-align:center}
+
+::selection{background:rgba(10,132,255,.28)}
+:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(10,132,255,.35)}
