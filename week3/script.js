@@ -380,11 +380,20 @@ function recommendForUser(u, topN = 10) {
   // Vectorized prediction for all items
   const { preds, dots, buScalar, biArray } = tf.tidy(() => {
     const pu = tf.gather(state.P, tf.tensor1d([u], 'int32')).reshape([state.k]); // [k]
-    const bu = state.bu.gather(tf.tensor1d([u], 'int32')).reshape([]);           // scalar
+const bu = state.bu.gather(tf.tensor1d([u], 'int32')).reshape([]);           // scalar
 
-    const dotVec = tf.matMul(state.Q, pu.reshape([state.k, 1])).reshape([state.I]); // [I]
-    const base = tf.addN([dotVec, state.bi, bu, state.mu]);                        // [I]
-    const clipped = tf.clipByValue(base, 1, 5);                                    // [I]
+const dotVec = tf.matMul(state.Q, pu.reshape([state.k, 1])).reshape([state.I]); // [I]
+
+// Было:
+// const base = tf.addN([dotVec, state.bi, bu, state.mu]);
+
+// Стало (правильно, с broadcasting скаляров):
+let base = tf.add(dotVec, state.bi); // [I]
+base = tf.add(base, bu);             // [I] + [] -> [I]
+base = tf.add(base, state.mu);       // [I] + [] -> [I]
+
+const clipped = tf.clipByValue(base, 1, 5);
+                                  // [I]
 
     return {
       preds: clipped, // [I]
