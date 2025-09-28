@@ -5,18 +5,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MovieLens MF — In-Browser (TensorFlow.js)</title>
+  
+<link rel="stylesheet" href="style.css">
+<script src="tf.min.js"></script>      <!-- сначала TF.js -->
+<script defer src="data.js"></script>   <!-- потом наши скрипты -->
+<script defer src="script.js"></script>
 
-  <!-- Style first -->
-  <link rel="stylesheet" href="style.css" />
-
-  <!-- Local TensorFlow.js (place tf.min.js next to this file) -->
-  <script src="tf.min.js"></script>
-
-  <!-- Data loaders (parsing u.item / u.data) -->
-  <script defer src="data.js"></script>
-
-  <!-- App logic (MF model, training, inference, UI) -->
-  <script defer src="script.js"></script>
 </head>
 <body>
   <div class="container">
