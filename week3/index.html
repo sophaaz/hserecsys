@@ -1,0 +1,124 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MovieLens MF — In-Browser (TensorFlow.js)</title>
+
+  <!-- Style first -->
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- Local TensorFlow.js (place tf.min.js next to this file) -->
+  <script src="tf.min.js"></script>
+
+  <!-- Data loaders (parsing u.item / u.data) -->
+  <script defer src="data.js"></script>
+
+  <!-- App logic (MF model, training, inference, UI) -->
+  <script defer src="script.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1 id="app-title">MovieLens — Matrix Factorization (In-Browser)</h1>
+      <p id="app-desc">Biased MF (μ + b<sub>u</sub> + b<sub>i</sub> + P<sub>u</sub>·Q<sub>i</sub>) trained with TensorFlow.js in your browser.</p>
+    </header>
+
+    <!-- Load Data -->
+    <section class="card">
+      <div class="row space-between">
+        <h2>1) Load Data</h2>
+        <button id="btn-load" class="btn primary">Load data</button>
+      </div>
+      <p id="status" class="muted">Waiting to load MovieLens files (u.item, u.data)...</p>
+      <div class="stats">
+        <div class="stat"><span id="stat-users">–</span><label>Users</label></div>
+        <div class="stat"><span id="stat-items">–</span><label>Items</label></div>
+        <div class="stat"><span id="stat-ratings">–</span><label>Ratings</label></div>
+        <div class="stat"><span id="stat-mu">–</span><label>μ (mean)</label></div>
+      </div>
+    </section>
+
+    <!-- Train -->
+    <section class="card">
+      <h2>2) Train (Matrix Factorization)</h2>
+      <div class="grid-5">
+        <div class="field">
+          <label for="param-k">k (factors)</label>
+          <input id="param-k" type="number" min="2" max="128" step="1" value="16">
+        </div>
+        <div class="field">
+          <label for="param-epochs">epochs</label>
+          <input id="param-epochs" type="number" min="1" max="100" step="1" value="15">
+        </div>
+        <div class="field">
+          <label for="param-batch">batch</label>
+          <input id="param-batch" type="number" min="64" max="4096" step="64" value="2048">
+        </div>
+        <div class="field">
+          <label for="param-lr">lr</label>
+          <input id="param-lr" type="number" min="0.0001" max="0.5" step="0.0001" value="0.01">
+        </div>
+        <div class="field">
+          <label for="param-lambda">lambda</label>
+          <input id="param-lambda" type="number" min="0" max="0.1" step="0.0001" value="0.0001">
+        </div>
+      </div>
+
+      <div class="row gap">
+        <button id="btn-train" class="btn primary" disabled>Train model</button>
+        <button id="btn-cancel" class="btn ghost" disabled>Cancel</button>
+      </div>
+
+      <div class="progress-wrap">
+        <div id="train-progress" class="progress"><div class="bar" style="width:0%"></div></div>
+        <div class="progress-info">
+          <span id="train-epoch">epoch –/–</span>
+          <span id="train-trainrmse">train RMSE: –</span>
+          <span id="train-valrmse">val RMSE: –</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Recommend -->
+    <section class="card">
+      <h2>3) Recommend</h2>
+      <div class="grid-3">
+        <div class="field">
+          <label for="user-select">User (rawId)</label>
+          <select id="user-select" disabled>
+            <option value="">— select user —</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="topn">Top-N</label>
+          <input id="topn" type="number" min="1" max="50" step="1" value="10">
+        </div>
+        <div class="field align-end">
+          <button id="btn-recommend" class="btn" disabled>Recommend</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table id="results-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Title</th>
+              <th>Genres</th>
+              <th>Predicted</th>
+              <th>Explain (μ | bᵤ | bᵢ | dot)</th>
+            </tr>
+          </thead>
+          <tbody><!-- filled by script.js --></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer class="muted small">
+      Data: MovieLens 100K — © GroupLens, University of Minnesota. Runs fully in your browser with TensorFlow.js.
+    </footer>
+  </div>
+</body>
+</html>
