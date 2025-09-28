@@ -1,7 +1,8 @@
 // script.js
 // Matrix Factorization (biased) in-browser with TensorFlow.js
 // r_hat(u,i) = mu + bu[u] + bi[i] + dot(P[u], Q[i])
-// UI: load -> train -> recommend. Clean memory, no leaks. All heavy ops inside tf.tidy.
+// Полный файл с правками: корректный парсинг чисел с запятой,
+// явный await tf.ready(), статусы, проверки сплита, аккуратная утилизация памяти.
 
 // ---------------- App State ----------------
 const state = {
@@ -13,7 +14,7 @@ const state = {
   U: 0,
   I: 0,
 
-  // Hyperparams (defaults; can be modified via UI)
+  // Hyperparams (defaults; редактируются в UI)
   k: 16,
   epochs: 15,
   batchSize: 2048,
@@ -51,11 +52,6 @@ function updateStatsUI() {
   $('#stat-mu').textContent = STATS.mean.toFixed(3);
 }
 
-function setTrainControlsEnabled(on) {
-  $('#btn-train').disabled = !on;
-  $('#btn-cancel').disabled = !on ? false : true; // cancel enabled only while training
-}
-
 function setRecommendControlsEnabled(on) {
   $('#user-select').disabled = !on;
   $('#btn-recommend').disabled = !on;
@@ -80,7 +76,7 @@ window.addEventListener('load', () => {
   $('#btn-cancel').addEventListener('click', onCancel);
   $('#btn-recommend').addEventListener('click', onRecommend);
 
-  // Defaults
+  // Defaults → UI
   $('#param-k').value = state.k;
   $('#param-epochs').value = state.epochs;
   $('#param-batch').value = state.batchSize;
@@ -127,7 +123,12 @@ async function onTrain() {
     return;
   }
 
-  // Read hyperparams
+  // Ждём инициализации TF.js (важно для некоторых браузеров)
+  await tf.ready();
+  console.log('TF backend:', tf.getBackend());
+  setStatus('Starting training…');
+
+  // Read hyperparams (поддержка запятой как десятичного разделителя)
   state.k = clampInt($('#param-k').value, 2, 128, 16);
   state.epochs = clampInt($('#param-epochs').value, 1, 100, 15);
   state.batchSize = clampInt($('#param-batch').value, 64, 4096, 2048);
@@ -138,8 +139,13 @@ async function onTrain() {
   disposeModel();
   buildModel();
 
-  // Make a deterministic-ish split 90/10
+  // Make a split 90/10
   makeTrainValSplit(0.9);
+  if (!state.split.trainIdx?.length || !state.split.valIdx?.length) {
+    setStatus('Train/val split is empty — check that ratings were parsed.', false);
+    $('#btn-train').disabled = false; $('#btn-cancel').disabled = true;
+    return;
+  }
 
   // UI state
   state.stopRequested = false;
@@ -175,7 +181,6 @@ function onCancel() {
 
 // Create TF variables and optimizer
 function buildModel() {
-  // Create variables
   state.P  = tf.variable(tf.randomNormal([state.U, state.k], 0, 0.01, 'float32'), true, 'P');
   state.Q  = tf.variable(tf.randomNormal([state.I, state.k], 0, 0.01, 'float32'), true, 'Q');
   state.bu = tf.variable(tf.zeros([state.U], 'float32'), true, 'bu');
@@ -206,7 +211,7 @@ function makeTrainValSplit(trainFrac = 0.9) {
   const idx = new Int32Array(n);
   for (let t = 0; t < n; t++) idx[t] = t;
 
-  // Simple Fisher-Yates shuffle
+  // Fisher–Yates shuffle
   for (let i = n - 1; i > 0; i--) {
     const j = (Math.random() * (i + 1)) | 0;
     const tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
@@ -225,10 +230,8 @@ async function trainLoop() {
   for (let epoch = 1; epoch <= state.epochs; epoch++) {
     if (state.stopRequested) break;
 
-    // Shuffle train indices each epoch
     shuffleInt32(state.split.trainIdx);
 
-    // Accumulate batch MSE to estimate train RMSE
     let mseSum = 0;
     let count = 0;
 
@@ -248,7 +251,7 @@ async function trainLoop() {
           const err = tf.sub(pred, rBatch);          // [B]
           const mse = tf.mean(tf.mul(err, err));     // scalar
 
-          // L2 regularization on only the gathered rows (standard in SGD setting)
+          // L2 regularization on gathered rows
           const Pu = tf.gather(state.P, uBatch);
           const Qi = tf.gather(state.Q, iBatch);
           const bu = tf.gather(state.bu, uBatch);
@@ -320,7 +323,7 @@ function predictBatch(uBatch, iBatch) {
     const dot = tf.sum(tf.mul(Pu, Qi), 1);   // [B]
     const base = tf.addN([dot, bu, bi]);     // [B]
     const withMu = tf.add(base, state.mu);   // [B]
-    return withMu;
+    return withMu; // не клиппим во время тренировки
   });
 }
 
@@ -372,38 +375,40 @@ function onRecommend() {
 
 // Compute predictions for user u for all items; filter already-rated; return topN with explanation parts
 function recommendForUser(u, topN = 10) {
-  // Build a mask for already rated items
   const seen = userRatedItems.get(u) || new Set();
 
-  // Predict all items in a single vectorized pass
-  const result = tf.tidy(() => {
+  // Vectorized prediction for all items
+  const { preds, dots, buScalar, biArray } = tf.tidy(() => {
     const pu = tf.gather(state.P, tf.tensor1d([u], 'int32')).reshape([state.k]); // [k]
-    const buScalar = state.bu.gather(tf.tensor1d([u], 'int32')).reshape([]);     // scalar
+    const bu = state.bu.gather(tf.tensor1d([u], 'int32')).reshape([]);           // scalar
 
-    // dot for all items: Q [I,k] · pu [k] => [I]
     const dotVec = tf.matMul(state.Q, pu.reshape([state.k, 1])).reshape([state.I]); // [I]
-    const base = tf.addN([dotVec, state.bi, buScalar, state.mu]);                  // [I]
+    const base = tf.addN([dotVec, state.bi, bu, state.mu]);                        // [I]
     const clipped = tf.clipByValue(base, 1, 5);                                    // [I]
-    return { dotVec, base, clipped };
+
+    return {
+      preds: clipped, // [I]
+      dots: dotVec,   // [I]
+      buScalar: bu,   // scalar
+      biArray: state.bi // [I] (variable; данные снимем отдельно)
+    };
   });
 
-  // Pull to CPU arrays once
-  const predArr = Array.from(result.clipped.dataSync());   // predicted in [1,5]
-  const dotArr  = Array.from(result.dotVec.dataSync());    // dot only
-  result.dotVec.dispose();
-  result.base.dispose();
-  result.clipped.dispose();
+  // Считываем на CPU одним заходом
+  const predArr = Array.from(preds.dataSync()); // [I]
+  const dotArr  = Array.from(dots.dataSync());  // [I]
+  const buVal   = (awaitScalar(buScalar));
+  const biArr   = Array.from(biArray.dataSync());
 
-  // Build candidate list
+  preds.dispose(); dots.dispose(); // buScalar и biArray — variables, не освобождаем
+
+  const mu = STATS.mean;
   const candidates = [];
+
   for (let i = 0; i < state.I; i++) {
     if (seen.has(i)) continue;
-    const bi = state.bi.dataSync()[i]; // safe for small I; if large, optimize by caching
-    const bu = state.bu.dataSync()[u];
-    const mu = STATS.mean;
-    const pred = predArr[i];
-    const movie = movies[i];
 
+    const movie = movies[i];
     candidates.push({
       rank: 0,
       u, i,
@@ -411,15 +416,12 @@ function recommendForUser(u, topN = 10) {
       rawItemId: movie.rawId,
       title: movie.title,
       genres: movie.genres,
-      pred,
-      parts: { mu, bu, bi, dot: dotArr[i] }
+      pred: predArr[i],
+      parts: { mu, bu: buVal, bi: biArr[i], dot: dotArr[i] }
     });
   }
 
-  // Sort by predicted desc
   candidates.sort((a, b) => b.pred - a.pred);
-
-  // Rank and slice
   for (let r = 0; r < candidates.length; r++) candidates[r].rank = r + 1;
   return candidates.slice(0, topN);
 }
@@ -467,12 +469,12 @@ function renderRecommendations(recs) {
 
 // ---------------- Utilities ----------------
 function clampInt(v, min, max, dflt) {
-  const n = Number(v);
+  const n = parseInt(String(v).replace(',', '.'), 10);
   if (!Number.isFinite(n)) return dflt;
-  return Math.max(min, Math.min(max, Math.round(n)));
+  return Math.max(min, Math.min(max, n));
 }
 function clampFloat(v, min, max, dflt) {
-  const n = Number(v);
+  const n = parseFloat(String(v).replace(',', '.'));
   if (!Number.isFinite(n)) return dflt;
   return Math.max(min, Math.min(max, n));
 }
@@ -483,7 +485,6 @@ function shuffleInt32(arr) {
   }
 }
 function getRawUserIdFromDense(uDense) {
-  // Reverse-lookup by scanning map once; cache result
   if (!getRawUserIdFromDense.cache) {
     const map = new Map(); // dense -> raw
     for (const [raw, dense] of userIndexByRawId.entries()) map.set(dense, raw);
@@ -493,5 +494,11 @@ function getRawUserIdFromDense(uDense) {
 }
 getRawUserIdFromDense.cache = null;
 
+function awaitScalar(scalarTensor) {
+  // Быстрое чтение одного скаляра
+  return scalarTensor.dataSync()[0];
+}
+
 // Clean TF resources on page unload
 window.addEventListener('beforeunload', disposeModel);
+
