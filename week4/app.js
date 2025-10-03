@@ -1,479 +1,409 @@
-class MovieLensApp {
-    constructor() {
-        this.interactions = [];
-        this.items = new Map();
-        this.userMap = new Map();
-        this.itemMap = new Map();
-        this.reverseUserMap = new Map();
-        this.reverseItemMap = new Map();
-        this.userTopRated = new Map();
-        this.model = null;
-        
-        this.config = {
-            maxInteractions: 80000,
-            embeddingDim: 32,
-            batchSize: 512,
-            epochs: 20,
-            learningRate: 0.001
-        };
-        
-        this.lossHistory = [];
-        this.isTraining = false;
-        
-        this.initializeUI();
-    }
-    
-    initializeUI() {
-        document.getElementById('loadData').addEventListener('click', () => this.loadData());
-        document.getElementById('train').addEventListener('click', () => this.train());
-        document.getElementById('test').addEventListener('click', () => this.test());
-        
-        this.updateStatus('Click "Load Data" to start');
-    }
-    
-    async loadData() {
-        this.updateStatus('Loading data...');
-        
-        try {
-            // Load interactions
-            const interactionsResponse = await fetch('data/u.data');
-            const interactionsText = await interactionsResponse.text();
-            const interactionsLines = interactionsText.trim().split('\n');
-            
-            this.interactions = interactionsLines.slice(0, this.config.maxInteractions).map(line => {
-                const [userId, itemId, rating, timestamp] = line.split('\t');
-                return {
-                    userId: parseInt(userId),
-                    itemId: parseInt(itemId),
-                    rating: parseFloat(rating),
-                    timestamp: parseInt(timestamp)
-                };
-            });
-            
-            // Load items
-            const itemsResponse = await fetch('data/u.item');
-            const itemsText = await itemsResponse.text();
-            const itemsLines = itemsText.trim().split('\n');
-            
-            itemsLines.forEach(line => {
-                const parts = line.split('|');
-                const itemId = parseInt(parts[0]);
-                const title = parts[1];
-                const yearMatch = title.match(/\((\d{4})\)$/);
-                const year = yearMatch ? parseInt(yearMatch[1]) : null;
-                
-                this.items.set(itemId, {
-                    title: title.replace(/\(\d{4}\)$/, '').trim(),
-                    year: year
-                });
-            });
-            
-            // Create mappings and find users with sufficient ratings
-            this.createMappings();
-            this.findQualifiedUsers();
-            
-            this.updateStatus(`Loaded ${this.interactions.length} interactions and ${this.items.size} items. ${this.userTopRated.size} users have 20+ ratings.`);
-            
-            document.getElementById('train').disabled = false;
-            
-        } catch (error) {
-            this.updateStatus(`Error loading data: ${error.message}`);
-        }
-    }
-    
-    createMappings() {
-        // Create user and item mappings to 0-based indices
-        const userSet = new Set(this.interactions.map(i => i.userId));
-        const itemSet = new Set(this.interactions.map(i => i.itemId));
-        
-        Array.from(userSet).forEach((userId, index) => {
-            this.userMap.set(userId, index);
-            this.reverseUserMap.set(index, userId);
-        });
-        
-        Array.from(itemSet).forEach((itemId, index) => {
-            this.itemMap.set(itemId, index);
-            this.reverseItemMap.set(index, itemId);
-        });
-        
-        // Group interactions by user and find top rated movies
-        const userInteractions = new Map();
-        this.interactions.forEach(interaction => {
-            const userId = interaction.userId;
-            if (!userInteractions.has(userId)) {
-                userInteractions.set(userId, []);
-            }
-            userInteractions.get(userId).push(interaction);
-        });
-        
-        // Sort each user's interactions by rating (desc) and timestamp (desc)
-        userInteractions.forEach((interactions, userId) => {
-            interactions.sort((a, b) => {
-                if (b.rating !== a.rating) return b.rating - a.rating;
-                return b.timestamp - a.timestamp;
-            });
-        });
-        
-        this.userTopRated = userInteractions;
-    }
-    
-    findQualifiedUsers() {
-        // Filter users with at least 20 ratings
-        const qualifiedUsers = [];
-        this.userTopRated.forEach((interactions, userId) => {
-            if (interactions.length >= 20) {
-                qualifiedUsers.push(userId);
-            }
-        });
-        this.qualifiedUsers = qualifiedUsers;
-    }
-    
-    async train() {
-        if (this.isTraining) return;
-        
-        this.isTraining = true;
-        document.getElementById('train').disabled = true;
-        this.lossHistory = [];
-        
-        this.updateStatus('Initializing model...');
-        
-        // Initialize model
-        this.model = new TwoTowerModel(
-            this.userMap.size,
-            this.itemMap.size,
-            this.config.embeddingDim
-        );
-        
-        // Prepare training data
-        const userIndices = this.interactions.map(i => this.userMap.get(i.userId));
-        const itemIndices = this.interactions.map(i => this.itemMap.get(i.itemId));
-        
-        this.updateStatus('Starting training...');
-        
-        // Training loop
-        const numBatches = Math.ceil(userIndices.length / this.config.batchSize);
-        
-        for (let epoch = 0; epoch < this.config.epochs; epoch++) {
-            let epochLoss = 0;
-            
-            for (let batch = 0; batch < numBatches; batch++) {
-                const start = batch * this.config.batchSize;
-                const end = Math.min(start + this.config.batchSize, userIndices.length);
-                
-                const batchUsers = userIndices.slice(start, end);
-                const batchItems = itemIndices.slice(start, end);
-                
-                const loss = await this.model.trainStep(batchUsers, batchItems);
-                epochLoss += loss;
-                
-                this.lossHistory.push(loss);
-                this.updateLossChart();
-                
-                if (batch % 10 === 0) {
-                    this.updateStatus(`Epoch ${epoch + 1}/${this.config.epochs}, Batch ${batch}/${numBatches}, Loss: ${loss.toFixed(4)}`);
-                }
-                
-                // Allow UI to update
-                await new Promise(resolve => setTimeout(resolve, 0));
-            }
-            
-            epochLoss /= numBatches;
-            this.updateStatus(`Epoch ${epoch + 1}/${this.config.epochs} completed. Average loss: ${epochLoss.toFixed(4)}`);
-        }
-        
-        this.isTraining = false;
-        document.getElementById('train').disabled = false;
-        document.getElementById('test').disabled = false;
-        
-        this.updateStatus('Training completed! Click "Test" to see recommendations.');
-        
-        // Visualize embeddings
-        this.visualizeEmbeddings();
-    }
-    
-    updateLossChart() {
-        const canvas = document.getElementById('lossChart');
-        const ctx = canvas.getContext('2d');
-        
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        if (this.lossHistory.length === 0) return;
-        
-        const maxLoss = Math.max(...this.lossHistory);
-        const minLoss = Math.min(...this.lossHistory);
-        const range = maxLoss - minLoss || 1;
-        
-        ctx.strokeStyle = '#007acc';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        
-        this.lossHistory.forEach((loss, index) => {
-            const x = (index / this.lossHistory.length) * canvas.width;
-            const y = canvas.height - ((loss - minLoss) / range) * canvas.height;
-            
-            if (index === 0) {
-                ctx.moveTo(x, y);
-            } else {
-                ctx.lineTo(x, y);
-            }
-        });
-        
-        ctx.stroke();
-        
-        // Add labels
-        ctx.fillStyle = '#000';
-        ctx.font = '12px Arial';
-        ctx.fillText(`Min: ${minLoss.toFixed(4)}`, 10, canvas.height - 10);
-        ctx.fillText(`Max: ${maxLoss.toFixed(4)}`, 10, 20);
-    }
-    
-    async visualizeEmbeddings() {
-        if (!this.model) return;
-        
-        this.updateStatus('Computing embedding visualization...');
-        
-        const canvas = document.getElementById('embeddingChart');
-        const ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        try {
-            // Sample items for visualization
-            const sampleSize = Math.min(500, this.itemMap.size);
-            const sampleIndices = Array.from({length: sampleSize}, (_, i) => 
-                Math.floor(i * this.itemMap.size / sampleSize)
-            );
-            
-            // Get embeddings and compute PCA
-            const embeddingsTensor = this.model.getItemEmbeddings();
-            const embeddings = embeddingsTensor.arraySync();
-            const sampleEmbeddings = sampleIndices.map(i => embeddings[i]);
-            
-            const projected = this.computePCA(sampleEmbeddings, 2);
-            
-            // Normalize to canvas coordinates
-            const xs = projected.map(p => p[0]);
-            const ys = projected.map(p => p[1]);
-            
-            const xMin = Math.min(...xs);
-            const xMax = Math.max(...xs);
-            const yMin = Math.min(...ys);
-            const yMax = Math.max(...ys);
-            
-            const xRange = xMax - xMin || 1;
-            const yRange = yMax - yMin || 1;
-            
-            // Draw points
-            ctx.fillStyle = 'rgba(0, 122, 204, 0.6)';
-            sampleIndices.forEach((itemIdx, i) => {
-                const x = ((projected[i][0] - xMin) / xRange) * (canvas.width - 40) + 20;
-                const y = ((projected[i][1] - yMin) / yRange) * (canvas.height - 40) + 20;
-                
-                ctx.beginPath();
-                ctx.arc(x, y, 3, 0, 2 * Math.PI);
-                ctx.fill();
-            });
-            
-            // Add title and labels
-            ctx.fillStyle = '#000';
-            ctx.font = '14px Arial';
-            ctx.fillText('Item Embeddings Projection (PCA)', 10, 20);
-            ctx.font = '12px Arial';
-            ctx.fillText(`Showing ${sampleSize} items`, 10, 40);
-            
-            this.updateStatus('Embedding visualization completed.');
-        } catch (error) {
-            this.updateStatus(`Error in visualization: ${error.message}`);
-        }
-    }
-    
-    computePCA(embeddings, dimensions) {
-        // Simple PCA using power iteration
-        const n = embeddings.length;
-        const dim = embeddings[0].length;
-        
-        // Center the data
-        const mean = Array(dim).fill(0);
-        embeddings.forEach(emb => {
-            emb.forEach((val, i) => mean[i] += val);
-        });
-        mean.forEach((val, i) => mean[i] = val / n);
-        
-        const centered = embeddings.map(emb => 
-            emb.map((val, i) => val - mean[i])
-        );
-        
-        // Compute covariance matrix
-        const covariance = Array(dim).fill(0).map(() => Array(dim).fill(0));
-        centered.forEach(emb => {
-            for (let i = 0; i < dim; i++) {
-                for (let j = 0; j < dim; j++) {
-                    covariance[i][j] += emb[i] * emb[j];
-                }
-            }
-        });
-        covariance.forEach(row => row.forEach((val, j) => row[j] = val / n));
-        
-        // Power iteration for first two components
-        const components = [];
-        for (let d = 0; d < dimensions; d++) {
-            let vector = Array(dim).fill(1/Math.sqrt(dim));
-            
-            for (let iter = 0; iter < 10; iter++) {
-                let newVector = Array(dim).fill(0);
-                
-                for (let i = 0; i < dim; i++) {
-                    for (let j = 0; j < dim; j++) {
-                        newVector[i] += covariance[i][j] * vector[j];
-                    }
-                }
-                
-                const norm = Math.sqrt(newVector.reduce((sum, val) => sum + val * val, 0));
-                vector = newVector.map(val => val / norm);
-            }
-            
-            components.push(vector);
-            
-            // Deflate the covariance matrix
-            for (let i = 0; i < dim; i++) {
-                for (let j = 0; j < dim; j++) {
-                    covariance[i][j] -= vector[i] * vector[j];
-                }
-            }
-        }
-        
-        // Project data
-        return embeddings.map(emb => {
-            return components.map(comp => 
-                emb.reduce((sum, val, i) => sum + val * comp[i], 0)
-            );
-        });
-    }
-    
-    async test() {
-        if (!this.model || this.qualifiedUsers.length === 0) {
-            this.updateStatus('Model not trained or no qualified users found.');
-            return;
-        }
-        
-        this.updateStatus('Generating recommendations...');
-        
-        try {
-            // Pick random qualified user
-            const randomUser = this.qualifiedUsers[Math.floor(Math.random() * this.qualifiedUsers.length)];
-            const userInteractions = this.userTopRated.get(randomUser);
-            const userIndex = this.userMap.get(randomUser);
-            
-            // Get user embedding
-            const userEmb = this.model.getUserEmbedding(userIndex);
-            
-            // Get scores for all items
-            const allItemScores = await this.model.getScoresForAllItems(userEmb);
-            
-            // Filter out items the user has already rated
-            const ratedItemIds = new Set(userInteractions.map(i => i.itemId));
-            const candidateScores = [];
-            
-            allItemScores.forEach((score, itemIndex) => {
-                const itemId = this.reverseItemMap.get(itemIndex);
-                if (!ratedItemIds.has(itemId)) {
-                    candidateScores.push({ itemId, score, itemIndex });
-                }
-            });
-            
-            // Sort by score descending and take top 10
-            candidateScores.sort((a, b) => b.score - a.score);
-            const topRecommendations = candidateScores.slice(0, 10);
-            
-            // Display results
-            this.displayResults(randomUser, userInteractions, topRecommendations);
-            
-        } catch (error) {
-            this.updateStatus(`Error generating recommendations: ${error.message}`);
-        }
-    }
-    
-    displayResults(userId, userInteractions, recommendations) {
-        const resultsDiv = document.getElementById('results');
-        
-        const topRated = userInteractions.slice(0, 10);
-        
-        let html = `
-            <h2>Recommendations for User ${userId}</h2>
-            <div class="side-by-side">
-                <div>
-                    <h3>Top 10 Rated Movies (Historical)</h3>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Rank</th>
-                                <th>Movie</th>
-                                <th>Rating</th>
-                                <th>Year</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-        `;
-        
-        topRated.forEach((interaction, index) => {
-            const item = this.items.get(interaction.itemId);
-            html += `
-                <tr>
-                    <td>${index + 1}</td>
-                    <td>${item.title}</td>
-                    <td>${interaction.rating}</td>
-                    <td>${item.year || 'N/A'}</td>
-                </tr>
-            `;
-        });
-        
-        html += `
-                        </tbody>
-                    </table>
-                </div>
-                <div>
-                    <h3>Top 10 Recommended Movies</h3>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Rank</th>
-                                <th>Movie</th>
-                                <th>Score</th>
-                                <th>Year</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-        `;
-        
-        recommendations.forEach((rec, index) => {
-            const item = this.items.get(rec.itemId);
-            html += `
-                <tr>
-                    <td>${index + 1}</td>
-                    <td>${item.title}</td>
-                    <td>${rec.score.toFixed(4)}</td>
-                    <td>${item.year || 'N/A'}</td>
-                </tr>
-            `;
-        });
-        
-        html += `
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        `;
-        
-        resultsDiv.innerHTML = html;
-        this.updateStatus('Recommendations generated successfully!');
-    }
-    
-    updateStatus(message) {
-        document.getElementById('status').textContent = message;
-    }
-}
+// app.js
+// -----------------------------------------------------------------------------
+// App glue-code for Two-Tower Recommender (TF.js) running fully in-browser.
+// - Загружает MovieLens файлы (u.item, u.data)
+// - Собирает плотные индексы пользователей/фильмов
+// - Строит жанровые матрицы features (itemGenres, userGenres)
+// - Инициализирует TwoTowerModel, тренирует по in-batch softmax
+// - Делает top-K рекомендации для выбранного пользователя
+//
+// Файл не зависит жёстко от разметки: если элементы UI есть — подключаемся,
+// если нет — всё работает через console/log.
+// Требуемый порядок подключений в index.html:
+//   <script src="tf.min.js"></script>
+//   <script src="two-tower.js"></script>
+//   <script src="app.js"></script>
+// -----------------------------------------------------------------------------
 
-// Initialize app when page loads
-let app;
-document.addEventListener('DOMContentLoaded', () => {
-    app = new MovieLensApp();
-});
+(async function AppBootstrap() {
+  'use strict';
+
+  // ------------------------------- Config ------------------------------------
+  const CONFIG = {
+    embDim: 32,            // выходная размерность башен
+    userHidden: 64,        // ширина скрытого слоя в user-tower
+    itemHidden: 64,        // ширина скрытого слоя в item-tower
+    learningRate: 0.01,    // Adam lr
+    l2: 1e-4,              // L2-регуляризация
+    normalize: true,       // L2-нормировка выходов башен (косинус-подобный скор)
+    epochs: 10,
+    batchSize: 2048,       // для in-batch softmax батч — это и позитивы, и негативы
+    posThreshold: 4,       // считаем позитивом rating >= 4
+    topK: 10,
+    genreCount: 19,        // в u.item 19 жанровых флагов (колонки 5..23)
+    files: {
+      item: './u.item',
+      data: './u.data'
+    }
+  };
+
+  // ------------------------------- State -------------------------------------
+  const ST = {
+    // Сырые словари
+    items: new Map(),            // rawItemId -> { title, year, genres[19] }
+    interactionsRaw: [],         // { userId, itemId, rating }
+
+    // Плотные индексы
+    userMap: new Map(),          // rawUserId -> u ∈ [0..U-1]
+    itemMap: new Map(),          // rawItemId -> i ∈ [0..I-1]
+    revUser: [],                 // u -> rawUserId
+    revItem: [],                 // i -> rawItemId
+
+    // Позитивные пары (для обучения two-tower)
+    positives: [],               // {u, i}
+
+    // Для фильтрации просмотренного при рекомендациях
+    userSeen: new Map(),         // u -> Set(i)
+
+    // Жанровые фичи
+    itemGenresDense: null,       // [I, 19] массив массивов (или Tensor2D в setFeatures)
+    userGenresDense: null,       // [U, 19] агрегат по историям
+
+    // Модель
+    model: null,                 // instance of TwoTowerModel
+
+    // Статистика
+    stats: { nUsers: 0, nItems: 0, nRatings: 0 }
+  };
+
+  // ------------------------------ DOM helpers --------------------------------
+  const $ = s => document.querySelector(s);
+  const on = (el, ev, fn) => el && el.addEventListener(ev, fn);
+
+  function setStatus(text, ok = null) {
+    const el = $('#status');
+    if (!el) { console.log('[status]', text); return; }
+    el.textContent = text;
+    el.className = 'muted';
+    if (ok === true) el.classList.add('status-ok');
+    if (ok === false) el.classList.add('status-err');
+  }
+
+  function setTrainUI({ epoch, epochs, loss }) {
+    const pe = $('#train-epoch');
+    const tr = $('#train-trainrmse'); // переиспользуем поле под loss (для простоты)
+    const vr = $('#train-valrmse');
+    if (pe) pe.textContent = `epoch ${epoch}/${epochs}`;
+    if (tr) tr.textContent = `loss: ${Number.isFinite(loss) ? loss.toFixed(4) : '–'}`;
+    if (vr) vr.textContent = `val RMSE: –`; // в two-tower сейчас не считаем RMSE
+  }
+
+  function setProgress(pct) {
+    const bar = $('#train-progress .bar');
+    if (bar) bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  }
+
+  function populateUsersSelect() {
+    const sel = $('#user-select');
+    if (!sel) return;
+    sel.innerHTML = '<option value="">— select user —</option>';
+    for (const rawId of ST.revUser.map((raw, u) => raw)) {
+      const opt = document.createElement('option');
+      opt.value = String(rawId);
+      opt.textContent = String(rawId);
+      sel.appendChild(opt);
+    }
+  }
+
+  function renderTopK(rawUserId, top) {
+    const tbody = $('#results-table tbody');
+    if (!tbody) { console.log('[topK]', top); return; }
+    tbody.innerHTML = '';
+    if (!top || top.length === 0) {
+      const tr = document.createElement('tr'); const td = document.createElement('td');
+      td.colSpan = 5; td.textContent = 'No recommendations.'; tr.appendChild(td); tbody.appendChild(tr); return;
+    }
+    top.forEach((r, idx) => {
+      const tr = document.createElement('tr');
+
+      const tdRank = document.createElement('td'); tdRank.textContent = String(idx + 1); tr.appendChild(tdRank);
+      const tdTitle = document.createElement('td'); tdTitle.textContent = r.title; tr.appendChild(tdTitle);
+      const tdGenres = document.createElement('td'); tdGenres.textContent = r.genres.join(', ') || '—'; tr.appendChild(tdGenres);
+      const tdPred = document.createElement('td'); tdPred.textContent = r.score.toFixed(3); tr.appendChild(tdPred);
+      const tdExplain = document.createElement('td'); tdExplain.textContent = 'two-tower dot score'; tr.appendChild(tdExplain);
+
+      tbody.appendChild(tr);
+    });
+  }
+
+  // ------------------------------ Data loading --------------------------------
+  // u.item: movieId|title|releaseDate|videoReleaseDate|imdbURL|g0..g18 (19 жанров)
+  async function loadItems() {
+    const res = await fetch(CONFIG.files.item);
+    if (!res.ok) throw new Error(`Failed to fetch ${CONFIG.files.item}: ${res.status}`);
+    const text = await res.text();
+    const lines = text.split('\n');
+
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      const parts = line.split('|');
+      if (parts.length < 5 + CONFIG.genreCount) continue;
+
+      const rawItemId = parseInt(parts[0], 10);
+      const title = (parts[1] || '').trim();
+      const m = title.match(/\((\d{4})\)\s*$/);
+      const year = m ? parseInt(m[1], 10) : null;
+
+      const flags = parts.slice(5, 5 + CONFIG.genreCount).map(v => (v === '1' || v === 1) ? 1 : 0);
+      ST.items.set(rawItemId, {
+        title: title.replace(/\(\d{4}\)\s*$/, '').trim(),
+        year,
+        genres: flags
+      });
+    }
+  }
+
+  // u.data: userId\titemId\trating\ttimestamp
+  async function loadRatings() {
+    const res = await fetch(CONFIG.files.data);
+    if (!res.ok) throw new Error(`Failed to fetch ${CONFIG.files.data}: ${res.status}`);
+    const text = await res.text();
+    const lines = text.split('\n');
+
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      const [uS, iS, rS] = line.split('\t');
+      if (!uS || !iS || !rS) continue;
+      const userId = parseInt(uS, 10);
+      const itemId = parseInt(iS, 10);
+      const rating = parseFloat(rS);
+      if (!Number.isFinite(userId) || !Number.isFinite(itemId) || !Number.isFinite(rating)) continue;
+      if (!ST.items.has(itemId)) continue; // фильтрация фильмов без метаданных
+      ST.interactionsRaw.push({ userId, itemId, rating });
+    }
+  }
+
+  // Плотные индексы raw→dense и обратно
+  function buildMappings() {
+    // Пользователи
+    {
+      const users = new Set(ST.interactionsRaw.map(x => x.userId));
+      let idx = 0;
+      for (const u of users) { ST.userMap.set(u, idx++); ST.revUser.push(u); }
+    }
+    // Фильмы
+    {
+      const items = Array.from(ST.items.keys());
+      items.sort((a, b) => a - b);
+      let idx = 0;
+      for (const i of items) { ST.itemMap.set(i, idx++); ST.revItem.push(i); }
+    }
+
+    // Заполняем userSeen и positives
+    ST.userSeen.clear(); ST.positives.length = 0;
+    for (const { userId, itemId, rating } of ST.interactionsRaw) {
+      const u = ST.userMap.get(userId);
+      const i = ST.itemMap.get(itemId);
+      if (u == null || i == null) continue;
+
+      if (!ST.userSeen.has(u)) ST.userSeen.set(u, new Set());
+      ST.userSeen.get(u).add(i);
+
+      if (rating >= CONFIG.posThreshold) ST.positives.push({ u, i });
+    }
+
+    ST.stats.nUsers = ST.revUser.length;
+    ST.stats.nItems = ST.revItem.length;
+    ST.stats.nRatings = ST.interactionsRaw.length;
+  }
+
+  // Матрица жанров фильмов [I, 19] + агрегат жанров пользователей [U, 19]
+  function buildGenreMatrices() {
+    const U = ST.stats.nUsers;
+    const I = ST.stats.nItems;
+    const G = CONFIG.genreCount;
+
+    // itemGenres: dense-порядок индексов
+    const itemGenres = Array.from({ length: I }, () => Array(G).fill(0));
+    for (let i = 0; i < I; i++) {
+      const rawItemId = ST.revItem[i];
+      const meta = ST.items.get(rawItemId);
+      itemGenres[i] = meta?.genres ? meta.genres.slice(0, G) : Array(G).fill(0);
+    }
+
+    // userGenres: суммируем жанры положительных фильмов (rating>=posThreshold)
+    const userGenres = Array.from({ length: U }, () => Array(G).fill(0));
+    for (const { u, i } of ST.positives) {
+      const gs = itemGenres[i];
+      for (let g = 0; g < G; g++) userGenres[u][g] += gs[g];
+    }
+
+    // L2-нормировка строк для стабильности
+    const l2 = row => {
+      let s = 0; for (const v of row) s += v * v;
+      const d = Math.sqrt(s) || 1;
+      return row.map(v => v / d);
+    };
+
+    ST.itemGenresDense = itemGenres.map(l2);
+    ST.userGenresDense = userGenres.map(l2);
+  }
+
+  // ------------------------------ Model wiring --------------------------------
+  function buildModel() {
+    if (ST.model) { ST.model.dispose(); ST.model = null; }
+    ST.model = new TwoTowerModel(
+      ST.stats.nUsers,
+      ST.stats.nItems,
+      CONFIG.embDim,
+      {
+        lossType: 'softmax',
+        lr: CONFIG.learningRate,
+        userHidden: CONFIG.userHidden,
+        itemHidden: CONFIG.itemHidden,
+        l2: CONFIG.l2,
+        normalize: CONFIG.normalize
+      }
+    );
+    ST.model.setFeatures({
+      itemGenres: ST.itemGenresDense,
+      userGenres: ST.userGenresDense
+    });
+  }
+
+  // ------------------------------- Training -----------------------------------
+  function* batchIterator(pairs, batchSize) {
+    // Перемешиваем индексы и отдаём батчи {users[], items[]}
+    const idx = pairs.map((_, i) => i);
+    for (let i = idx.length - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0; [idx[i], idx[j]] = [idx[j], idx[i]];
+    }
+    for (let start = 0; start < idx.length; start += batchSize) {
+      const end = Math.min(idx.length, start + batchSize);
+      const u = new Int32Array(end - start);
+      const it = new Int32Array(end - start);
+      for (let b = 0; b < end - start; b++) {
+        const p = pairs[idx[start + b]];
+        u[b] = p.u; it[b] = p.i;
+      }
+      yield { users: u, items: it, size: (end - start), pct: end / idx.length };
+    }
+  }
+
+  async function train() {
+    if (!ST.model) { setStatus('Model is not initialized', false); return; }
+    if (ST.positives.length === 0) { setStatus('No positive pairs to train on', false); return; }
+
+    setStatus('Training…');
+    setProgress(0);
+    for (let epoch = 1; epoch <= CONFIG.epochs; epoch++) {
+      let lossSum = 0, count = 0;
+
+      for (const batch of batchIterator(ST.positives, CONFIG.batchSize)) {
+        const loss = await ST.model.trainStep(batch.users, batch.items);
+        lossSum += loss * batch.size; count += batch.size;
+        setTrainUI({ epoch, epochs: CONFIG.epochs, loss });
+        setProgress(((epoch - 1) / CONFIG.epochs + batch.pct / CONFIG.epochs) * 100);
+        // подышим, чтобы UI не зависал
+        await tf.nextFrame();
+      }
+
+      const meanLoss = lossSum / Math.max(1, count);
+      console.log(`[epoch ${epoch}/${CONFIG.epochs}] loss=${meanLoss.toFixed(5)}`);
+    }
+    setProgress(100);
+    setStatus('Training complete', true);
+  }
+
+  // ----------------------------- Recommendations ------------------------------
+  async function recommendForRawUser(rawUserId, K = CONFIG.topK) {
+    if (!ST.model) { setStatus('Train a model first', false); return []; }
+    const u = ST.userMap.get(rawUserId);
+    if (u == null) { setStatus('Unknown user id', false); return []; }
+
+    // Получаем top-K по dot(u, all items), затем выбрасываем уже просмотренные
+    const seen = ST.userSeen.get(u) || new Set();
+    const { indices, scores } = await ST.model.getTopKForUser(u, Math.min(ST.stats.nItems, Math.max(K * 5, 200)));
+
+    const out = [];
+    for (let k = 0; k < indices.length && out.length < K; k++) {
+      const i = indices[k];
+      if (seen.has(i)) continue;
+      const rawItemId = ST.revItem[i];
+      const meta = ST.items.get(rawItemId);
+      out.push({
+        itemIndex: i,
+        rawItemId,
+        title: meta?.title || `Movie ${rawItemId}`,
+        genres: (meta?.genres || []).map((v, g) => v ? GENRES[g] : null).filter(Boolean),
+        score: scores[k]
+      });
+    }
+    return out;
+  }
+
+  // GENRES справочник (для печати жанров в таблице)
+  const GENRES = [
+    "unknown","Action","Adventure","Animation","Children's","Comedy","Crime",
+    "Documentary","Drama","Fantasy","Film-Noir","Horror","Musical",
+    "Mystery","Romance","Sci-Fi","Thriller","War","Western"
+  ];
+
+  // ------------------------------- UI binding ---------------------------------
+  on(window, 'load', async () => {
+    // Вешаем обработчики, если элементы существуют
+    on($('#btn-load'), 'click', async () => {
+      try {
+        setStatus('Loading u.item and u.data…');
+        await tf.ready();
+        await Promise.all([loadItems(), loadRatings()]);
+        buildMappings();
+        buildGenreMatrices();
+        populateUsersSelect();
+        setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings}`, true);
+        // Отрисуем счётчики, если такая панель есть
+        const su = $('#stat-users'), si = $('#stat-items'), sr = $('#stat-ratings');
+        if (su) su.textContent = String(ST.stats.nUsers);
+        if (si) si.textContent = String(ST.stats.nItems);
+        if (sr) sr.textContent = String(ST.stats.nRatings);
+      } catch (e) {
+        console.error(e); setStatus(e.message || 'Load error', false);
+      }
+    });
+
+    on($('#btn-train'), 'click', async () => {
+      try {
+        if (!ST.stats.nUsers || !ST.stats.nItems) { setStatus('Load data first', false); return; }
+        // Обновим конфиг из инпутов, если они есть
+        const getNum = (sel, dflt) => {
+          const el = $(sel); if (!el) return dflt;
+          const v = parseFloat(String(el.value).replace(',', '.'));
+          return Number.isFinite(v) ? v : dflt;
+        };
+        CONFIG.embDim       = getNum('#param-k', CONFIG.embDim);
+        CONFIG.epochs       = getNum('#param-epochs', CONFIG.epochs);
+        CONFIG.batchSize    = getNum('#param-batch', CONFIG.batchSize);
+        CONFIG.learningRate = getNum('#param-lr', CONFIG.learningRate);
+        CONFIG.l2           = getNum('#param-lambda', CONFIG.l2);
+
+        buildModel();
+        await train();
+      } catch (e) {
+        console.error(e); setStatus(e.message || 'Training error', false);
+      }
+    });
+
+    on($('#btn-recommend'), 'click', async () => {
+      try {
+        const sel = $('#user-select');
+        const raw = sel ? parseInt(sel.value, 10) : NaN;
+        if (!Number.isFinite(raw)) { setStatus('Select a user', false); return; }
+        const topNEl = $('#topn');
+        const K = topNEl ? Math.max(1, Math.min(50, parseInt(topNEl.value, 10) || CONFIG.topK)) : CONFIG.topK;
+        setStatus('Scoring…');
+        const recs = await recommendForRawUser(raw, K);
+        renderTopK(raw, recs);
+        setStatus('Done', true);
+      } catch (e) {
+        console.error(e); setStatus(e.message || 'Recommend error', false);
+      }
+    });
+  });
+
+  // ------------------------------- Expose for debug ---------------------------
+  window._tt = { ST, CONFIG, recommendForRawUser, buildModel, train };
+
+})();
+
