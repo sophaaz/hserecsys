@@ -1,4 +1,4 @@
-// app.js — Two-Tower demo glue (TF.js) — совместим с index.html (loadData/train/test)
+// app.js — Two-Tower demo glue (TF.js) — работает с index.html (loadData/train/test)
 // -----------------------------------------------------------------------------
 (async function App() {
   'use strict';
@@ -11,13 +11,16 @@
     learningRate: 0.01,
     l2: 1e-4,
     normalize: true,
-    epochs: 10,
-    batchSize: 2048,
+
+    // По запросу: 20 эпох, batch = 157
+    epochs: 20,
+    batchSize: 157,
+
     posThreshold: 4,
     topK: 10,
     genreCount: 19,
     files: {
-      item: 'data/u.item',   // ВАЖНО: файлы лежат в /data
+      item: 'data/u.item', // индекс.html использует файлы из папки /data
       data: 'data/u.data'
     }
   };
@@ -30,21 +33,24 @@
     itemMap: new Map(),          // rawItemId -> i
     revUser: [],                 // u -> rawUserId
     revItem: [],                 // i -> rawItemId
-    positives: [],               // {u,i} (rating>=posThreshold)
+    positives: [],               // {u,i} для обучения
     userSeen: new Map(),         // u -> Set(i)
     itemGenresDense: null,       // [I,19]
     userGenresDense: null,       // [U,19]
     model: null,
-    stats: { nUsers: 0, nItems: 0, nRatings: 0 }
+    stats: { nUsers: 0, nItems: 0, nRatings: 0 },
+    lossHistory: []
   };
 
   // ------------------------------- DOM ---------------------------------------
   const $ = s => document.querySelector(s);
-  const btnLoad  = $('#loadData');   // из index.html
-  const btnTrain = $('#train');      // из index.html
-  const btnTest  = $('#test');       // из index.html
-  const statusEl = $('#status');     // из index.html
-  const resultsEl = $('#results');   // из index.html
+  const btnLoad  = $('#loadData');
+  const btnTrain = $('#train');
+  const btnTest  = $('#test');
+  const statusEl = $('#status');
+  const lossCanvas = $('#lossChart');
+  const pcaCanvas  = $('#embeddingChart');
+  const resultsEl  = $('#results');
 
   const GENRES = [
     "unknown","Action","Adventure","Animation","Children's","Comedy","Crime",
@@ -52,30 +58,9 @@
     "Mystery","Romance","Sci-Fi","Thriller","War","Western"
   ];
 
-  function setStatus(msg, kind='info') {
-    if (!statusEl) return console.log('[status]', msg);
-    statusEl.textContent = msg;
-  }
-
-  function renderResults(list) {
-    if (!resultsEl) return console.log('[results]', list);
-    if (!list || !list.length) {
-      resultsEl.innerHTML = '<p>No recommendations.</p>';
-      return;
-    }
-    const rows = list.map((r, idx) => `
-      <tr>
-        <td>${idx + 1}</td>
-        <td>${escapeHtml(r.title)}</td>
-        <td>${r.genres.join(', ') || '—'}</td>
-        <td>${r.score.toFixed(3)}</td>
-      </tr>`).join('');
-    resultsEl.innerHTML = `
-      <h3>Recommendations</h3>
-      <table>
-        <thead><tr><th>#</th><th>Title</th><th>Genres</th><th>Score</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`;
+  function setStatus(msg) {
+    if (statusEl) statusEl.textContent = msg;
+    else console.log('[status]', msg);
   }
 
   function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -94,10 +79,8 @@
       const line = lines[lineNo].trim();
       if (!line) continue;
       const parts = line.split('|');
-      if (parts.length < 5 + G) {
-        console.warn(`[u.item] skip malformed line ${lineNo + 1} (got ${parts.length})`);
-        continue;
-      }
+      if (parts.length < 5 + G) continue;
+
       const rawItemId = parseInt(parts[0], 10);
       const titleRaw = String(parts[1] ?? '');
       const yearMatch = /\((\d{4})\)\s*$/.exec(titleRaw);
@@ -210,30 +193,117 @@
       const u = new Int32Array(end - start);
       const it = new Int32Array(end - start);
       for (let b = 0; b < end - start; b++) { const p = pairs[idx[start + b]]; u[b] = p.u; it[b] = p.i; }
-      yield { users: u, items: it, size: (end - start) };
+      yield { users: u, items: it, size: (end - start), pct: end / idx.length };
     }
+  }
+
+  // ------------------------------ Training + charts ---------------------------
+  function drawLoss() {
+    if (!lossCanvas) return;
+    const ctx = lossCanvas.getContext('2d');
+    const W = lossCanvas.width, H = lossCanvas.height;
+    ctx.clearRect(0,0,W,H);
+
+    if (!ST.lossHistory.length) return;
+    const maxV = Math.max(...ST.lossHistory);
+    const minV = Math.min(...ST.lossHistory);
+    const range = (maxV - minV) || 1;
+
+    // оси
+    ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(40,10); ctx.lineTo(40,H-30); ctx.lineTo(W-10,H-30); ctx.stroke();
+
+    // линия лосса
+    ctx.strokeStyle = '#007acc'; ctx.lineWidth = 2; ctx.beginPath();
+    ST.lossHistory.forEach((v, i) => {
+      const x = 40 + (i/(ST.lossHistory.length-1))*(W-50);
+      const y = (H-30) - ((v - minV)/range)*(H-40);
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+
+    // подписи
+    ctx.fillStyle = '#000'; ctx.font = '12px Arial';
+    ctx.fillText(`min ${minV.toFixed(4)}`, 45, 14);
+    ctx.fillText(`max ${maxV.toFixed(4)}`, 120, 14);
+    ctx.fillText('batches →', W-90, H-12);
   }
 
   async function train() {
     if (!ST.model) { setStatus('Model is not initialized'); return; }
     if (!ST.positives.length) { setStatus('No positive pairs to train on'); return; }
+    await tf.ready();
     setStatus('Training…');
-    let seen = 0;
+
+    ST.lossHistory.length = 0;
     for (let epoch = 1; epoch <= CONFIG.epochs; epoch++) {
-      let lossSum = 0, cnt = 0;
+      let lossSum = 0, count = 0;
+
       for (const batch of batchIterator(ST.positives, CONFIG.batchSize)) {
         const loss = await ST.model.trainStep(batch.users, batch.items);
-        lossSum += loss * batch.size; cnt += batch.size; seen += batch.size;
-        if (cnt % (CONFIG.batchSize * 2) === 0) setStatus(`Training… epoch ${epoch}/${CONFIG.epochs}, loss ~ ${ (lossSum/cnt).toFixed(4) }`);
+        lossSum += loss * batch.size; count += batch.size;
+        ST.lossHistory.push(loss);
+        drawLoss();
+        setStatus(`Epoch ${epoch}/${CONFIG.epochs} — loss ~ ${(lossSum/count).toFixed(4)}`);
         await tf.nextFrame();
       }
-      setStatus(`Epoch ${epoch}/${CONFIG.epochs} done, mean loss = ${(lossSum / Math.max(1,cnt)).toFixed(5)}`);
+
+      const meanLoss = lossSum / Math.max(1, count);
+      console.log(`[epoch ${epoch}/${CONFIG.epochs}] mean loss = ${meanLoss.toFixed(5)}`);
     }
+
     setStatus('Training complete ✅');
+    btnTest && (btnTest.disabled = false);
+    await drawItemPCA(); // визуализация эмбеддингов после обучения
   }
 
+  // ------------------------------ PCA (500 items) -----------------------------
+  async function drawItemPCA() {
+    if (!pcaCanvas || !ST.model) return;
+    const ctx = pcaCanvas.getContext('2d'), W = pcaCanvas.width, H = pcaCanvas.height;
+    ctx.clearRect(0,0,W,H);
+    setStatus('Computing PCA (500 items)…');
+
+    // 1) Получаем все эмбеддинги айтемов, берём равномерную подвыборку 500
+    const I = await ST.model.materializeItemEmbeddings();
+    const total = I.shape[0];
+    const N = Math.min(500, total);
+    const idxArr = new Int32Array(N);
+    for (let i=0;i<N;i++) idxArr[i] = Math.floor(i * total / N);
+    const idx = tf.tensor1d(idxArr, 'int32');
+    const X = tf.gather(I, idx);                    // [N, D]
+
+    // 2) Центрирование и SVD → первые 2 компоненты
+    const Xc = tf.tidy(() => {
+      const mean = tf.mean(X, 0, true);            // [1,D]
+      return X.sub(mean);
+    });
+    const { v } = tf.svd(Xc, true);                 // v: [D,D]
+    const V2 = v.slice([0,0],[v.shape[0],2]);       // [D,2]
+    const proj = tf.matMul(Xc, V2);                 // [N,2]
+    const pts = await proj.array();
+
+    // 3) Нормируем в координаты канваса и рисуем
+    const xs = pts.map(p=>p[0]), ys = pts.map(p=>p[1]);
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    const xR = (xMax - xMin) || 1, yR = (yMax - yMin) || 1;
+
+    ctx.fillStyle = 'rgba(0,122,204,0.65)';
+    for (let i=0;i<N;i++){
+      const x = ((pts[i][0]-xMin)/xR) * (W-40) + 20;
+      const y = ((pts[i][1]-yMin)/yR) * (H-40) + 20;
+      ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.fillStyle = '#000'; ctx.font = '12px Arial';
+    ctx.fillText(`Item Embeddings projection (PCA) • ${N} items`, 10, 18);
+
+    // 4) чистим временные тензоры
+    idx.dispose(); X.dispose(); Xc.dispose(); v.dispose(); V2.dispose(); proj.dispose();
+  }
+
+  // ----------------------------- Recommendations ------------------------------
   function pickUserRaw(minPos = 5) {
-    // выбираем юзера с достаточным числом оценённых фильмов
     for (let u = 0; u < ST.revUser.length; u++) {
       if ((ST.userSeen.get(u)?.size || 0) >= minPos) return ST.revUser[u];
     }
@@ -265,6 +335,26 @@
     return out;
   }
 
+  function renderResults(list, rawUserId) {
+    if (!resultsEl) return console.log('[results]', list);
+    if (!list?.length) { resultsEl.innerHTML = '<p>No recommendations.</p>'; return; }
+
+    const rows = list.map((r, idx) => `
+      <tr>
+        <td>${idx + 1}</td>
+        <td>${escapeHtml(r.title)}</td>
+        <td>${r.genres.join(', ') || '—'}</td>
+        <td>${r.score.toFixed(3)}</td>
+      </tr>`).join('');
+
+    resultsEl.innerHTML = `
+      <h3>Top ${list.length} Recommendations for User ${rawUserId}</h3>
+      <table>
+        <thead><tr><th>#</th><th>Title</th><th>Genres</th><th>Score</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
   // ------------------------------- UI events ----------------------------------
   if (btnLoad) btnLoad.onclick = async () => {
     try {
@@ -274,7 +364,7 @@
       buildMappings();
       buildGenreMatrices();
       setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings}`);
-      if (btnTrain) btnTrain.disabled = false;
+      btnTrain && (btnTrain.disabled = false);
     } catch (e) {
       console.error(e); setStatus(`Load error: ${e?.message || e}`);
     }
@@ -285,7 +375,6 @@
       if (!ST.stats.nUsers || !ST.stats.nItems) { setStatus('Load data first'); return; }
       buildModel();
       await train();
-      if (btnTest) btnTest.disabled = false;
     } catch (e) {
       console.error(e); setStatus(`Training error: ${e?.message || e}`);
     }
@@ -297,7 +386,7 @@
       const rawUser = pickUserRaw(5);
       setStatus(`Scoring for user ${rawUser}…`);
       const recs = await recommendForRawUser(rawUser, CONFIG.topK);
-      renderResults(recs);
+      renderResults(recs, rawUser);
       setStatus(`Done. Shown top ${recs.length} for user ${rawUser}`);
     } catch (e) {
       console.error(e); setStatus(`Test error: ${e?.message || e}`);
