@@ -13,8 +13,8 @@
     normalize: true,
 
     // По запросу: 20 эпох, batch = 157
-    epochs: 20,
-    batchSize: 157,
+    epochs: 10,
+    batchSize: 2048,
 
     posThreshold: 4,
     topK: 10,
