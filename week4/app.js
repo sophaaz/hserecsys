@@ -422,3 +422,36 @@ async function loadItems() {
 
 })();
 
+async function handleLoadClick() {
+  try {
+    setStatus('Loading u.item and u.data…');
+    await tf.ready();
+    await Promise.all([loadItems(), loadRatings()]);
+    buildMappings();
+    buildGenreMatrices();
+    populateUsersSelect();
+    setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings}`, true);
+    // обновим счётчики, если панель есть
+    const su = $('#stat-users'), si = $('#stat-items'), sr = $('#stat-ratings');
+    if (su) su.textContent = String(ST.stats.nUsers);
+    if (si) si.textContent = String(ST.stats.nItems);
+    if (sr) sr.textContent = String(ST.stats.nRatings);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Load error: ${e?.message || e}`, false);
+  }
+}
+
+// Делегирование: поймаем клик на любой кнопке с нужным id/атрибутом
+document.addEventListener('click', (ev) => {
+  const loadBtn = ev.target?.closest?.('#btn-load, [data-action="load-data"]');
+  const trainBtn = ev.target?.closest?.('#btn-train, [data-action="train-model"]');
+  const recBtn   = ev.target?.closest?.('#btn-recommend, [data-action="recommend"]');
+  if (loadBtn) { ev.preventDefault(); handleLoadClick(); }
+  if (trainBtn) { ev.preventDefault(); (async ()=>{ buildModel(); await train(); })(); }
+  if (recBtn) { ev.preventDefault(); (async ()=>{ 
+      const sel = $('#user-select'); const raw = sel ? parseInt(sel.value,10) : NaN;
+      const topNEl = $('#topn'); const K = topNEl ? Math.max(1, Math.min(50, parseInt(topNEl.value,10)||CONFIG.topK)) : CONFIG.topK;
+      const recs = await recommendForRawUser(raw, K); renderTopK(raw, recs); setStatus('Done', true);
+  })(); }
+});
