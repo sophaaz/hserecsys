@@ -111,43 +111,109 @@ Visualization:
 After training, take a sample (e.g., 1,000 items), project item embeddings to 2D with PCA (simple power method or SVD via numeric approximation) and draw scatter with titles on hover.
 c) two-tower.js
 
-Implement a minimal Two‑Tower in TF.js:
+Class
 
-Class TwoTowerModel:
+TwoTowerModel(numUsers, numItems, embDim, opts)
 
-constructor(numUsers, numItems, embDim)
+opts: { lossType: 'softmax'|'bpr', lr, userHidden, itemHidden, l2, normalize=true }
 
-userEmbedding: tf.variable(tf.randomNormal([numUsers, embDim], stddev=0.05))
+ID-Embedding таблицы (базовые, остаются как есть)
 
-itemEmbedding: tf.variable(tf.randomNormal([numItems, embDim], stddev=0.05))
+userEmbedding = tf.variable(tf.randomNormal([numUsers, embDim], 0, 0.05))
 
-userForward(userIdxTensor) → embeddings gather
+itemEmbedding = tf.variable(tf.randomNormal([numItems, embDim], 0, 0.05))
 
-itemForward(itemIdxTensor) → embeddings gather
+Пояснение: это не «deep-модуль». Это обучаемые таблицы ID-векторов. Дальше мы добавляем MLP (минимум 1 hidden layer) в каждой башне и используем жанры как контент-фичу.
 
-score(uEmb, iEmb): dot product along last dim
+Фичи из данных (обязательно жанры из u.item)
 
-Loss:
+setFeatures({ itemGenres, userGenres?, normalizeRows=true })
 
-Option 1 (default): in‑batch sampled softmax
+itemGenres: Tensor2D [numItems, 19] (one-hot по жанрам из u.item). При normalizeRows — L2-нормировка строк.
 
-For a batch of user embeddings U and positive item embeddings I+, compute logits = U @ I^T, labels = diagonal; apply softmax cross‑entropy.
-Option 2: BPR pairwise loss
+userGenres (опционально): Tensor2D [numUsers, 19] (агрегат из u.data: частоты/средние рейтинги по жанрам; тоже L2-нормировать).
 
-Sample negative items I−; loss = −log σ(score(U, I+) − score(U, I−)).
-Provide a flag to switch.
+Deep модуль в башнях (главное изменение)
 
-Training step:
+userForward(userIdx: int32 [B]) → Tensor2D [B, embDim]
 
-Adam optimizer; gradient tape to update both embedding tables.
+idEmb = gather(userEmbedding, userIdx) → [B, embDim]
 
-Return scalar loss for UI plotting.
+feats = concat(idEmb, userGenres[userIdx]) если userGenres есть; иначе feats = idEmb
 
-Inference:
+MLP:
+h = Dense(units=userHidden, activation='relu')(feats)
+out = Dense(units=embDim, activation=null)(h)
 
-getUserEmbedding(uIdx)
+Если normalize=true → out = L2Normalize(out, axis=1)
 
-getScoresForAllItems(uEmb, itemEmbMatrix) with batched matmul; return top‑K indices.
+Вернуть out как эмбеддинг пользователя.
+
+itemForward(itemIdx: int32 [B]) → Tensor2D [B, embDim]
+
+idEmb = gather(itemEmbedding, itemIdx) → [B, embDim]
+
+feats = concat(idEmb, itemGenres[itemIdx]) → [B, embDim+19]
+
+MLP:
+h = Dense(units=itemHidden, activation='relu')(feats)
+out = Dense(units=embDim, activation=null)(h)
+
+Опционально L2-нормализация по оси 1.
+
+Вернуть out как эмбеддинг айтема.
+
+Комментарии в коде (обязательно):
+
+Почему two-towers (раздельные кодеры, быстрое retrieval).
+
+Зачем concat(ID, жанры) → смешиваем коллаборативный и контент-сигнал.
+
+Зачем Dense → нелинейная проекция фич в общее пространство.
+
+Зачем L2-норма → превратить dot в косинус-подобный скор.
+
+Scoring
+
+score(uEmb, iEmb) = sum(uEmb * iEmb, axis=1)
+
+Для in-batch softmax: logits = U @ Ipos^T → [B,B] (диагональ — позитивы).
+
+Loss (выбор флагом)
+
+Default: in-batch sampled softmax: −mean(log softmax(diagonal)) + L2 на U, Ipos, а также на собранных строках userEmbedding/itemEmbedding.
+
+BPR: −mean( log σ( score(U,I+) − score(U,I−) ) ) + тот же L2.
+
+Training step
+
+Adam(lr), tf.GradientTape/minimize, tf.tidy.
+
+Возвращать скалярный loss (для UI).
+
+Инвалидировать кеш предвычисленных item-векторов после шага.
+
+Inference / Retrieval
+
+getUserEmbedding(uIdx) → Tensor1D [embDim]
+
+materializeItemEmbeddings(batch=4096) → Tensor2D [numItems, embDim] (кеш)
+
+getTopKForUser(uIdx, K) → {indices, scores} через I @ u.
+
+Perf/Memory
+
+Всё временное в tf.tidy; await tf.nextFrame() в долгих циклах.
+
+Не плодить gather в цикле — батчевать.
+
+Acceptance
+
+Лосс убывает/стабилизируется, top-K адекватен.
+
+Башни действительно содержат Dense-слой(и); в логе слоёв видно размеры userHidden/itemHidden.
+
+Используются жанры из u.item (а при наличии — userGenres из u.data).
 
 Comments:
 
