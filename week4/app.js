@@ -128,31 +128,46 @@
 
   // ------------------------------ Data loading --------------------------------
   // u.item: movieId|title|releaseDate|videoReleaseDate|imdbURL|g0..g18 (19 жанров)
-  async function loadItems() {
-    const res = await fetch(CONFIG.files.item);
-    if (!res.ok) throw new Error(`Failed to fetch ${CONFIG.files.item}: ${res.status}`);
-    const text = await res.text();
-    const lines = text.split('\n');
+async function loadItems() {
+  const res = await fetch(CONFIG.files.item);
+  if (!res.ok) throw new Error(`Failed to fetch ${CONFIG.files.item}: ${res.status}`);
+  const text = await res.text();
+  const lines = text.split(/\r?\n/);
+  const G = CONFIG.genreCount;
 
-    for (const raw of lines) {
-      const line = raw.trim();
-      if (!line) continue;
-      const parts = line.split('|');
-      if (parts.length < 5 + CONFIG.genreCount) continue;
+  ST.items.clear();
 
-      const rawItemId = parseInt(parts[0], 10);
-      const title = (parts[1] || '').trim();
-      const m = title.match(/\((\d{4})\)\s*$/);
-      const year = m ? parseInt(m[1], 10) : null;
+  for (let lineNo = 0; lineNo < lines.length; lineNo++) {
+    const raw = lines[lineNo];
+    const line = raw.trim();
+    if (!line) continue;
 
-      const flags = parts.slice(5, 5 + CONFIG.genreCount).map(v => (v === '1' || v === 1) ? 1 : 0);
-      ST.items.set(rawItemId, {
-        title: title.replace(/\(\d{4}\)\s*$/, '').trim(),
-        year,
-        genres: flags
-      });
+    const parts = line.split('|');
+    // строгая валидация: в ML-100K должно быть минимум 5 + 19 полей
+    if (parts.length < 5 + G) {
+      // можно залогировать и пропустить «битую» строку, чтобы не падать
+      console.warn(`[u.item] skip malformed line ${lineNo + 1}: expected >= ${5 + G} fields, got ${parts.length}`);
+      continue;
     }
+
+    const rawItemId = parseInt(parts[0], 10);
+    // title всегда приводим к строке, даже если поле пустое
+    const titleRaw = String(parts[1] ?? '');
+    const yearMatch = /\((\d{4})\)\s*$/.exec(titleRaw);    // безопасный exec вместо .match на undefined
+    const year = yearMatch ? parseInt(yearMatch[1], 10) : null;
+    const title = titleRaw.replace(/\(\d{4}\)\s*$/, '').trim();
+
+    // жанры: колонки 5..(5+G-1)
+    const flags = new Array(G);
+    for (let g = 0; g < G; g++) {
+      const v = parts[5 + g];
+      flags[g] = (v === '1' || v === 1) ? 1 : 0;
+    }
+
+    ST.items.set(rawItemId, { title, year, genres: flags });
   }
+}
+   
 
   // u.data: userId\titemId\trating\ttimestamp
   async function loadRatings() {
