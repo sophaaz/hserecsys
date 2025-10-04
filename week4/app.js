@@ -1,12 +1,9 @@
-// app.js — Two-Tower demo (TF.js) — CPU backend fix, fast train, 3 tables, PCA on Test
+// app.js — Two-Tower demo (TF.js) — стабильное обучение на CPU, UI-прогресс, 3 таблицы, PCA на 500
 // -----------------------------------------------------------------------------
-// Ключ: жёстко форсим CPU-бэкенд TF.js, чтобы обойти падения WebGL ("Neg.js"/backend undefined).
-// -----------------------------------------------------------------------------
-
 (async function App() {
   'use strict';
 
-  // ------------------------------ Global error tap ----------------------------
+  // ------------------------------ Глобальный перехват ошибок ------------------
   window.addEventListener('error', (e) => {
     console.error('[GlobalError]', e.message, e.filename, e.lineno, e.colno, e.error?.stack || '');
   });
@@ -17,14 +14,14 @@
     userHidden: 64,
     itemHidden: 64,
 
-    // Быстро и экономно
+    // Базовые гиперы (будут авто-тюнинговаться под CPU)
     learningRate: 0.003,
     l2: 1e-4,
     normalize: true,
-    lossType: 'bpr',     // быстрее, чем in-batch softmax
+    lossType: 'bpr',     // быстрее и экономнее, чем in-batch softmax
 
-    epochs: 6,
-    batchSize: 2048,
+    epochs: 6,           // базово; на CPU уменьшаем
+    batchSize: 2048,     // базово; на CPU уменьшаем
 
     posThreshold: 4,
     topK: 10,
@@ -35,9 +32,9 @@
     },
 
     // Графики / PCA
-    lossDrawEvery: 5,
-    pcaItems: 500,       // 500 точек
-    pcaPowerIters: 40,   // итераций степенного метода
+    lossDrawEvery: 3,    // чаще обновляем график, чтобы UI жил
+    pcaItems: 500,
+    pcaPowerIters: 40,
 
     // Исторический топ
     minRatingsForHistoricalTop: 50
@@ -65,7 +62,8 @@
 
     model: null,
     stats: { nUsers: 0, nItems: 0, nRatings: 0 },
-    lossHistory: []
+    lossHistory: [],
+    backend: 'unknown'
   };
 
   // ------------------------------- DOM ---------------------------------------
@@ -78,7 +76,6 @@
   const pcaCanvas  = $('#embeddingChart');
   const resultsEl  = $('#results');
 
-  // контейнер для трёх таблиц (если нет — создадим внизу)
   let tablesHost = $('#comparison-tables');
   if (!tablesHost) {
     tablesHost = document.createElement('div');
@@ -95,31 +92,25 @@
   const setStatus = msg => (statusEl ? (statusEl.textContent = msg) : console.log('[status]', msg));
   const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-  // --------------------------- Robust TF initialization (CPU) -----------------
-  let _backend = 'unknown';
-
+  // --------------------------- Инициализация TF: форс CPU ---------------------
   async function ensureTF_CPU() {
     if (typeof tf === 'undefined') {
-      throw new Error('TensorFlow.js not loaded. Include <script src="tf.min.js"></script> before scripts.');
+      throw new Error('TensorFlow.js не загружен. Подключите tf.min.js до app.js.');
     }
-    // Жёстко перключаемся на CPU — это надёжно на любых машинах и сборках TF.js.
+    // Жёстко переключаемся на CPU, чтобы обойти крэши WebGL (Neg.js/backend undefined)
     try {
-      // Если уже CPU — просто готовимся
-      if (safeGetBackend() !== 'cpu') {
-        await tf.setBackend('cpu');
-      }
-      await tf.ready();
-      _backend = safeGetBackend() || 'cpu';
-    } catch (e) {
-      console.warn('[tf] Forcing CPU backend fallback:', e?.message || e);
       await tf.setBackend('cpu');
       await tf.ready();
-      _backend = safeGetBackend() || 'cpu';
+    } catch (e) {
+      console.warn('[tf] setBackend(cpu) issue:', e?.message || e);
+      // даже если бросило — попробуем продолжить
+      await tf.ready();
     }
-  }
-
-  function safeGetBackend() {
-    try { return tf.getBackend(); } catch { return null; }
+    try {
+      ST.backend = tf.getBackend();
+    } catch {
+      ST.backend = 'cpu';
+    }
   }
 
   // ------------------------------ Data loading --------------------------------
@@ -211,6 +202,20 @@
     ST.stats.nUsers = ST.revUser.length;
     ST.stats.nItems = ST.revItem.length;
     ST.stats.nRatings = ST.interactionsRaw.length;
+
+    // Если позитивов слишком мало (например, из-за sparsity) — ослабим порог до 3
+    if (ST.positives.length < 1000) {
+      ST.positives.length = 0;
+      ST.userSeen.clear();
+      for (const { userId, itemId, rating } of ST.interactionsRaw) {
+        const u = ST.userMap.get(userId);
+        const i = ST.itemMap.get(itemId);
+        if (u == null || i == null) continue;
+        if (!ST.userSeen.has(u)) ST.userSeen.set(u, new Set());
+        ST.userSeen.get(u).add(i);
+        if (rating >= 3) ST.positives.push({ u, i });
+      }
+    }
   }
 
   function buildGenreMatrices() {
@@ -294,41 +299,65 @@
     ctx.fillText('batches →', W-90, H-12);
   }
 
+  function effectiveTrainParams() {
+    // Если CPU — уменьшаем вычислительную нагрузку
+    const isCPU = (ST.backend || 'cpu') === 'cpu';
+    return {
+      epochs: isCPU ? Math.min(4, CONFIG.epochs) : CONFIG.epochs,
+      batch:  isCPU ? Math.min(256, CONFIG.batchSize) : CONFIG.batchSize,
+      drawEvery: isCPU ? 1 : CONFIG.lossDrawEvery
+    };
+  }
+
   async function train() {
-    await ensureTF_CPU();          // <-- Жёстко CPU до начала тренировки
+    await ensureTF_CPU();          // <-- гарантируем CPU и готовность
     if (!ST.model) { setStatus('Model is not initialized'); return; }
     if (!ST.positives.length) { setStatus('No positive pairs to train on'); return; }
 
-    setStatus(`Training… (backend: ${_backend})`);
+    const { epochs, batch, drawEvery } = effectiveTrainParams();
+
+    // Блокируем кнопки на время тренировки
+    if (btnLoad)  btnLoad.disabled = true;
+    if (btnTrain) btnTrain.disabled = true;
+    if (btnTest)  btnTest.disabled = true;
+
+    setStatus(`Training… (backend: ${ST.backend}, epochs=${epochs}, batch=${batch})`);
 
     ST.lossHistory.length = 0;
     let batchCount = 0;
 
-    for (let epoch = 1; epoch <= CONFIG.epochs; epoch++) {
+    // Подсчитаем количество батчей (для прогресса)
+    const totalBatches = Math.ceil(ST.positives.length / batch) * epochs;
+    let doneBatches = 0;
+
+    for (let epoch = 1; epoch <= epochs; epoch++) {
       let lossSum = 0, count = 0;
 
-      for (const batch of batchIterator(ST.positives, CONFIG.batchSize)) {
-        const loss = await ST.model.trainStep(batch.users, batch.items);
-        lossSum += loss * batch.size; count += batch.size;
+      for (const bt of batchIterator(ST.positives, batch)) {
+        const loss = await ST.model.trainStep(bt.users, bt.items);
+        lossSum += loss * bt.size; count += bt.size;
         ST.lossHistory.push(loss);
-        batchCount++;
+        batchCount++; doneBatches++;
 
-        if (batchCount % CONFIG.lossDrawEvery === 0) {
+        if (batchCount % drawEvery === 0) {
           drawLoss();
-          setStatus(`Epoch ${epoch}/${CONFIG.epochs} — loss ~ ${(lossSum/count).toFixed(4)} (backend: ${_backend})`);
-          await tf.nextFrame();
+          const pct = Math.round((doneBatches / totalBatches) * 100);
+          setStatus(`Epoch ${epoch}/${epochs} — loss ~ ${(lossSum/count).toFixed(4)} — ${pct}% (backend: ${ST.backend})`);
+          await tf.nextFrame(); // отдаём кадр UI
         }
       }
 
       const meanLoss = lossSum / Math.max(1, count);
-      console.log(`[epoch ${epoch}/${CONFIG.epochs}] mean loss = ${meanLoss.toFixed(5)}`);
+      console.log(`[epoch ${epoch}/${epochs}] mean loss = ${meanLoss.toFixed(5)}`);
     }
 
     drawLoss();
     setStatus('Training complete ✅');
-    btnTest && (btnTest.disabled = false);
 
-    // ВАЖНО: PCA НЕ внутри train(), чтобы "Training error" не зависел от визуализации
+    // Разблокируем кнопки
+    if (btnLoad)  btnLoad.disabled = false;
+    if (btnTrain) btnTrain.disabled = false;
+    if (btnTest)  btnTest.disabled = false;
   }
 
   // ------------------------------ PCA (power iteration, 500 items) ------------
@@ -338,7 +367,7 @@
     if (!pcaCanvas.width || !pcaCanvas.height) { pcaCanvas.width = 640; pcaCanvas.height = 420; }
     const ctx = pcaCanvas.getContext('2d'), W = pcaCanvas.width, H = pcaCanvas.height;
     ctx.clearRect(0,0,W,H);
-    setStatus(`Computing PCA (500 items)… (backend: ${_backend})`);
+    setStatus(`Computing PCA (500 items)… (backend: ${ST.backend})`);
 
     // 1) Эмбеддинги айтемов + равномерная подвыборка 500
     const I = await ST.model.materializeItemEmbeddings(); // [M, D]
@@ -351,7 +380,7 @@
     const idx = tf.tensor1d(idxArr, 'int32');
     const X = tf.gather(I, idx);                    // [N, D]
 
-    // 2) Центрируем
+    // 2) Центрирование
     const mean = tf.mean(X, 0, true);               // [1,D]
     const Xc = X.sub(mean);                         // [N,D]
 
@@ -394,7 +423,7 @@
     Cov.dispose(); v1.dispose(); Cov_v1.dispose(); l1.dispose(); v1T.dispose(); outer1.dispose(); Cov2.dispose(); v2.dispose(); V2.dispose(); proj.dispose();
   }
 
-  // Power iteration: возвращает нормированный вектор столбец [D,1]
+  // Power iteration: нормированный вектор-столбец [D,1]
   async function powerIteration(C, iters = 40) {
     return tf.tidy(() => {
       let v = tf.randomNormal([C.shape[0], 1]); // [D,1]
@@ -422,7 +451,7 @@
     return out.slice(0, 10);
   }
 
-  // --------- Baseline (без DL): контент-бейз по жанрам (косинус) --------------
+  // --------- Baseline (без DL): контент-бейс по жанрам (косинус) --------------
   function getTopKContentBaseline(uIdx, K = CONFIG.topK) {
     const uVec = ST.userGenresDense[uIdx]; // L2-норм
     const seen = ST.userSeen.get(uIdx) || new Set();
@@ -513,8 +542,8 @@
       await Promise.all([loadItems(), loadRatings()]);
       buildMappingsAndAggregates();
       buildGenreMatrices();
-      setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings} (backend: ${_backend})`);
-      btnTrain && (btnTrain.disabled = false);
+      setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings} (backend: ${ST.backend})`);
+      if (btnTrain) btnTrain.disabled = false;
 
       // Сразу покажем Historical Top 10
       const historical = getTop10Historical();
@@ -531,6 +560,8 @@
       await train();
     } catch (e) {
       console.error(e); setStatus(`Training error: ${e?.message || e}`);
+      if (btnTrain) btnTrain.disabled = false;
+      if (btnTest)  btnTest.disabled  = false;
     }
   };
 
@@ -541,7 +572,7 @@
 
       // выберем юзера с приличной историей
       const rawUser = pickUserRaw(5);
-      setStatus(`Scoring for user ${rawUser}… (backend: ${_backend})`);
+      setStatus(`Scoring for user ${rawUser}… (backend: ${ST.backend})`);
 
       const uIdx = ST.userMap.get(rawUser);
 
@@ -567,7 +598,7 @@
       // PCA после отрисовки таблиц
       await drawItemPCA();
 
-      setStatus(`Done. Shown top ${withGenres.length} for user ${rawUser} (backend: ${_backend})`);
+      setStatus(`Done. Shown top ${withGenres.length} for user ${rawUser} (backend: ${ST.backend})`);
     } catch (e) {
       console.error(e); setStatus(`Test error: ${e?.message || e}`);
     }
