@@ -1,4 +1,4 @@
-// app.js — Two-Tower demo glue (TF.js) — работает с index.html (loadData/train/test)
+// app.js — Two-Tower demo (TF.js) — fast train + 3 comparison tables + robust PCA
 // -----------------------------------------------------------------------------
 (async function App() {
   'use strict';
@@ -8,35 +8,52 @@
     embDim: 32,
     userHidden: 64,
     itemHidden: 64,
-    learningRate: 0.01,
+
+    // Быстрее тренируем: BPR + меньше эпох + крупный батч
+    learningRate: 0.003,
     l2: 1e-4,
     normalize: true,
+    lossType: 'bpr',     // 'bpr' быстрее, чем in-batch softmax
 
-    // По запросу: 20 эпох, batch = 157
-    epochs: 10,
+    epochs: 6,
     batchSize: 2048,
 
     posThreshold: 4,
     topK: 10,
     genreCount: 19,
     files: {
-      item: 'data/u.item', // индекс.html использует файлы из папки /data
+      item: 'data/u.item',
       data: 'data/u.data'
-    }
+    },
+
+    // Графики / PCA
+    lossDrawEvery: 5,
+    pcaItems: 500,
+
+    // Исторический топ – порог по количеству оценок
+    minRatingsForHistoricalTop: 50
   };
 
   // ------------------------------- State -------------------------------------
   const ST = {
     items: new Map(),            // rawItemId -> { title, year, genres[19] }
     interactionsRaw: [],         // { userId, itemId, rating }
+
     userMap: new Map(),          // rawUserId -> u
     itemMap: new Map(),          // rawItemId -> i
     revUser: [],                 // u -> rawUserId
     revItem: [],                 // i -> rawItemId
-    positives: [],               // {u,i} для обучения
+
+    positives: [],               // {u,i} (rating>=posThreshold)
     userSeen: new Map(),         // u -> Set(i)
-    itemGenresDense: null,       // [I,19]
-    userGenresDense: null,       // [U,19]
+
+    itemGenresDense: null,       // [I,19] L2-норм
+    userGenresDense: null,       // [U,19] L2-норм
+
+    // агрегаты для исторического топа
+    itemSum: null,               // Float32Array[I]
+    itemCnt: null,               // Uint32Array[I]
+
     model: null,
     stats: { nUsers: 0, nItems: 0, nRatings: 0 },
     lossHistory: []
@@ -52,18 +69,22 @@
   const pcaCanvas  = $('#embeddingChart');
   const resultsEl  = $('#results');
 
+  // контейнер для трёх таблиц (если нет — создадим внизу)
+  let tablesHost = $('#comparison-tables');
+  if (!tablesHost) {
+    tablesHost = document.createElement('div');
+    tablesHost.id = 'comparison-tables';
+    document.body.appendChild(tablesHost);
+  }
+
   const GENRES = [
     "unknown","Action","Adventure","Animation","Children's","Comedy","Crime",
     "Documentary","Drama","Fantasy","Film-Noir","Horror","Musical",
     "Mystery","Romance","Sci-Fi","Thriller","War","Western"
   ];
 
-  function setStatus(msg) {
-    if (statusEl) statusEl.textContent = msg;
-    else console.log('[status]', msg);
-  }
-
-  function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  const setStatus = msg => (statusEl ? (statusEl.textContent = msg) : console.log('[status]', msg));
+  const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
   // ------------------------------ Data loading --------------------------------
   // u.item: movieId|title|...|g0..g18
@@ -118,7 +139,7 @@
     }
   }
 
-  function buildMappings() {
+  function buildMappingsAndAggregates() {
     // users
     {
       const users = new Set(ST.interactionsRaw.map(x => x.userId));
@@ -132,7 +153,11 @@
       for (const i of items) { ST.itemMap.set(i, idx++); ST.revItem.push(i); }
     }
 
-    // seen + positives
+    const I = ST.revItem.length;
+    ST.itemSum = new Float32Array(I);
+    ST.itemCnt = new Uint32Array(I);
+
+    // seen + positives + агрегаты по фильмам
     ST.userSeen.clear(); ST.positives.length = 0;
     for (const { userId, itemId, rating } of ST.interactionsRaw) {
       const u = ST.userMap.get(userId);
@@ -142,6 +167,9 @@
       if (!ST.userSeen.has(u)) ST.userSeen.set(u, new Set());
       ST.userSeen.get(u).add(i);
       if (rating >= CONFIG.posThreshold) ST.positives.push({ u, i });
+
+      ST.itemSum[i] += rating;
+      ST.itemCnt[i] += 1;
     }
 
     ST.stats.nUsers = ST.revUser.length;
@@ -179,7 +207,7 @@
     if (ST.model) { ST.model.dispose(); ST.model = null; }
     ST.model = new TwoTowerModel(
       ST.stats.nUsers, ST.stats.nItems, CONFIG.embDim,
-      { lossType: 'softmax', lr: CONFIG.learningRate, userHidden: CONFIG.userHidden,
+      { lossType: CONFIG.lossType, lr: CONFIG.learningRate, userHidden: CONFIG.userHidden,
         itemHidden: CONFIG.itemHidden, l2: CONFIG.l2, normalize: CONFIG.normalize }
     );
     ST.model.setFeatures({ itemGenres: ST.itemGenresDense, userGenres: ST.userGenresDense });
@@ -200,6 +228,8 @@
   // ------------------------------ Training + charts ---------------------------
   function drawLoss() {
     if (!lossCanvas) return;
+    // если канвас без размеров — зададим
+    if (!lossCanvas.width || !lossCanvas.height) { lossCanvas.width = 640; lossCanvas.height = 220; }
     const ctx = lossCanvas.getContext('2d');
     const W = lossCanvas.width, H = lossCanvas.height;
     ctx.clearRect(0,0,W,H);
@@ -236,6 +266,8 @@
     setStatus('Training…');
 
     ST.lossHistory.length = 0;
+    let batchCount = 0;
+
     for (let epoch = 1; epoch <= CONFIG.epochs; epoch++) {
       let lossSum = 0, count = 0;
 
@@ -243,47 +275,69 @@
         const loss = await ST.model.trainStep(batch.users, batch.items);
         lossSum += loss * batch.size; count += batch.size;
         ST.lossHistory.push(loss);
-        drawLoss();
-        setStatus(`Epoch ${epoch}/${CONFIG.epochs} — loss ~ ${(lossSum/count).toFixed(4)}`);
-        await tf.nextFrame();
+        batchCount++;
+
+        if (batchCount % CONFIG.lossDrawEvery === 0) {
+          drawLoss();
+          setStatus(`Epoch ${epoch}/${CONFIG.epochs} — loss ~ ${(lossSum/count).toFixed(4)}`);
+          await tf.nextFrame();
+        }
       }
 
       const meanLoss = lossSum / Math.max(1, count);
       console.log(`[epoch ${epoch}/${CONFIG.epochs}] mean loss = ${meanLoss.toFixed(5)}`);
     }
 
+    // финальный рендер графика
+    drawLoss();
     setStatus('Training complete ✅');
     btnTest && (btnTest.disabled = false);
-    await drawItemPCA(); // визуализация эмбеддингов после обучения
+    await drawItemPCA();
   }
 
-  // ------------------------------ PCA (500 items) -----------------------------
+  // ------------------------------ PCA (500 items, robust) ---------------------
   async function drawItemPCA() {
     if (!pcaCanvas || !ST.model) return;
+    if (!pcaCanvas.width || !pcaCanvas.height) { pcaCanvas.width = 640; pcaCanvas.height = 420; }
     const ctx = pcaCanvas.getContext('2d'), W = pcaCanvas.width, H = pcaCanvas.height;
     ctx.clearRect(0,0,W,H);
-    setStatus('Computing PCA (500 items)…');
+    setStatus('Computing PCA (up to 500 items)…');
 
-    // 1) Получаем все эмбеддинги айтемов, берём равномерную подвыборку 500
+    // 1) Эмбеддинги айтемов + подвыборка
     const I = await ST.model.materializeItemEmbeddings();
     const total = I.shape[0];
-    const N = Math.min(500, total);
+    const N = Math.min(CONFIG.pcaItems, total);
+    if (N < 2) return; // нечего рисовать
     const idxArr = new Int32Array(N);
     for (let i=0;i<N;i++) idxArr[i] = Math.floor(i * total / N);
     const idx = tf.tensor1d(idxArr, 'int32');
     const X = tf.gather(I, idx);                    // [N, D]
 
-    // 2) Центрирование и SVD → первые 2 компоненты
-    const Xc = tf.tidy(() => {
-      const mean = tf.mean(X, 0, true);            // [1,D]
-      return X.sub(mean);
-    });
-    const { v } = tf.svd(Xc, true);                 // v: [D,D]
-    const V2 = v.slice([0,0],[v.shape[0],2]);       // [D,2]
-    const proj = tf.matMul(Xc, V2);                 // [N,2]
-    const pts = await proj.array();
+    // 2) Центрирование
+    const mean = tf.mean(X, 0, true);               // [1,D]
+    const Xc = X.sub(mean);                         // [N,D]
 
-    // 3) Нормируем в координаты канваса и рисуем
+    // 3) PCA: пытаемся через SVD, при ошибке — фолбэк на первые 2 оси
+    let pts;
+    try {
+      const svd = tf.svd ? tf.svd : null;
+      if (!svd) throw new Error('svd not available');
+      const { v } = tf.svd(Xc, true);               // v: [D,D]
+      const V2 = v.slice([0,0],[v.shape[0],2]);     // [D,2]
+      const proj = tf.matMul(Xc, V2);               // [N,2]
+      pts = await proj.array();
+      v.dispose(); V2.dispose(); proj.dispose();
+    } catch (e) {
+      // фолбэк: просто первые две координаты
+      const D = Xc.shape[1];
+      const take = Math.min(2, D);
+      const proj = Xc.slice([0,0],[N,take]).arraySync();
+      // если только одна ось — добавим нулевую вторую
+      if (take === 1) pts = proj.map(row => [row[0], 0]);
+      else pts = proj;
+    }
+
+    // 4) Нормируем к канвасу и рисуем
     const xs = pts.map(p=>p[0]), ys = pts.map(p=>p[1]);
     const xMin = Math.min(...xs), xMax = Math.max(...xs);
     const yMin = Math.min(...ys), yMax = Math.max(...ys);
@@ -296,46 +350,64 @@
       ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI*2); ctx.fill();
     }
     ctx.fillStyle = '#000'; ctx.font = '12px Arial';
-    ctx.fillText(`Item Embeddings projection (PCA) • ${N} items`, 10, 18);
+    ctx.fillText(`Item Embeddings projection • ${N} items`, 10, 18);
 
-    // 4) чистим временные тензоры
-    idx.dispose(); X.dispose(); Xc.dispose(); v.dispose(); V2.dispose(); proj.dispose();
+    // 5) чистим временные тензоры
+    idx.dispose(); X.dispose(); Xc.dispose(); mean.dispose();
   }
 
-  // ----------------------------- Recommendations ------------------------------
-  function pickUserRaw(minPos = 5) {
-    for (let u = 0; u < ST.revUser.length; u++) {
-      if ((ST.userSeen.get(u)?.size || 0) >= minPos) return ST.revUser[u];
+  // --------------------------- Historical Top 10 -------------------------------
+  function getTop10Historical() {
+    const out = [];
+    for (let i = 0; i < ST.stats.nItems; i++) {
+      const cnt = ST.itemCnt[i];
+      if (cnt < CONFIG.minRatingsForHistoricalTop) continue;
+      const avg = ST.itemSum[i] / cnt;
+      const rawItemId = ST.revItem[i];
+      const meta = ST.items.get(rawItemId);
+      out.push({ i, rawItemId, title: meta?.title || `Movie ${rawItemId}`, year: meta?.year ?? '—', rating: avg, cnt });
     }
-    return ST.revUser[0];
+    out.sort((a,b) => b.rating - a.rating || b.cnt - a.cnt);
+    return out.slice(0, 10);
   }
 
-  async function recommendForRawUser(rawUserId, K = CONFIG.topK) {
-    if (!ST.model) { setStatus('Train a model first'); return []; }
-    const u = ST.userMap.get(rawUserId);
-    if (u == null) { setStatus('Unknown user id'); return []; }
+  // --------- Baseline (без DL): контент-бейз по жанрам (косинус) --------------
+  function getTopKContentBaseline(uIdx, K = CONFIG.topK) {
+    const uVec = ST.userGenresDense[uIdx]; // уже L2-норм
+    const seen = ST.userSeen.get(uIdx) || new Set();
+    const scores = [];
+    for (let i = 0; i < ST.stats.nItems; i++) {
+      if (seen.has(i)) continue;
+      const gi = ST.itemGenresDense[i]; // L2-норм → dot == cosine
+      let s = 0;
+      for (let g = 0; g < CONFIG.genreCount; g++) s += (uVec[g] * gi[g]);
+      if (s > 0) {
+        const rawItemId = ST.revItem[i];
+        const meta = ST.items.get(rawItemId);
+        scores.push({ i, rawItemId, title: meta?.title || `Movie ${rawItemId}`, year: meta?.year ?? '—', rating: s });
+      }
+    }
+    scores.sort((a,b) => b.rating - a.rating);
+    return scores.slice(0, K);
+  }
 
-    const seen = ST.userSeen.get(u) || new Set();
-    const { indices, scores } = await ST.model.getTopKForUser(u, Math.min(ST.stats.nItems, Math.max(K * 5, 200)));
-
+  // --------- DL (two-tower): top-K по dot(u, items) ---------------------------
+  async function getTopKDeep(uIdx, K = CONFIG.topK) {
+    const seen = ST.userSeen.get(uIdx) || new Set();
+    const { indices, scores } = await ST.model.getTopKForUser(uIdx, Math.min(ST.stats.nItems, Math.max(K*5, 200)));
     const out = [];
     for (let k = 0; k < indices.length && out.length < K; k++) {
       const i = indices[k];
       if (seen.has(i)) continue;
       const rawItemId = ST.revItem[i];
       const meta = ST.items.get(rawItemId);
-      out.push({
-        itemIndex: i,
-        rawItemId,
-        title: meta?.title || `Movie ${rawItemId}`,
-        genres: (meta?.genres || []).map((v, g) => v ? GENRES[g] : null).filter(Boolean),
-        score: scores[k]
-      });
+      out.push({ i, rawItemId, title: meta?.title || `Movie ${rawItemId}`, year: meta?.year ?? '—', rating: scores[k] });
     }
     return out;
   }
 
-  function renderResults(list, rawUserId) {
+  // ----------------------------- Render helpers --------------------------------
+  function renderRecommendations(list, rawUserId) {
     if (!resultsEl) return console.log('[results]', list);
     if (!list?.length) { resultsEl.innerHTML = '<p>No recommendations.</p>'; return; }
 
@@ -343,8 +415,8 @@
       <tr>
         <td>${idx + 1}</td>
         <td>${escapeHtml(r.title)}</td>
-        <td>${r.genres.join(', ') || '—'}</td>
-        <td>${r.score.toFixed(3)}</td>
+        <td>${(r.genres || []).join(', ') || '—'}</td>
+        <td>${Number.isFinite(r.rating) ? r.rating.toFixed(3) : '—'}</td>
       </tr>`).join('');
 
     resultsEl.innerHTML = `
@@ -355,16 +427,46 @@
       </table>`;
   }
 
-  // ------------------------------- UI events ----------------------------------
+  function renderComparisonTables({ historical, baseline, deep }) {
+    const mkTable = (title, rows) => {
+      const trs = rows.map((r, idx) => `
+        <tr>
+          <td>${idx + 1}</td>
+          <td>${escapeHtml(r.title)}</td>
+          <td>${Number.isFinite(r.rating) ? r.rating.toFixed(3) : '—'}</td>
+          <td>${r.year ?? '—'}</td>
+        </tr>`).join('');
+      return `
+        <section class="comp-table">
+          <h3>${title}</h3>
+          <table>
+            <thead><tr><th>rank</th><th>movie</th><th>rating</th><th>year</th></tr></thead>
+            <tbody>${trs}</tbody>
+          </table>
+        </section>`;
+    };
+
+    tablesHost.innerHTML = [
+      mkTable('Top 10 Rated Movies (Historical)', historical),
+      mkTable('Top 10 Recommended Movies without deep learning', baseline),
+      mkTable('Top 10 Recommended Movies with deep learning', deep),
+    ].join('');
+  }
+
+  // ------------------------------- UI flow ------------------------------------
   if (btnLoad) btnLoad.onclick = async () => {
     try {
       setStatus('Loading data…');
       await tf.ready();
       await Promise.all([loadItems(), loadRatings()]);
-      buildMappings();
+      buildMappingsAndAggregates();
       buildGenreMatrices();
       setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings}`);
       btnTrain && (btnTrain.disabled = false);
+
+      // Сразу покажем Historical Top 10 (для пустого сравнения)
+      const historical = getTop10Historical();
+      renderComparisonTables({ historical, baseline: [], deep: [] });
     } catch (e) {
       console.error(e); setStatus(`Load error: ${e?.message || e}`);
     }
@@ -383,17 +485,45 @@
   if (btnTest) btnTest.onclick = async () => {
     try {
       if (!ST.model) { setStatus('Train model first'); return; }
+      // выберем юзера с приличной историей
       const rawUser = pickUserRaw(5);
       setStatus(`Scoring for user ${rawUser}…`);
-      const recs = await recommendForRawUser(rawUser, CONFIG.topK);
-      renderResults(recs, rawUser);
-      setStatus(`Done. Shown top ${recs.length} for user ${rawUser}`);
+
+      // DL рекомендации
+      const uIdx = ST.userMap.get(rawUser);
+      const deep = await getTopKDeep(uIdx, CONFIG.topK);
+
+      // Baseline контент-бейз (без DL)
+      const baseline = getTopKContentBaseline(uIdx, CONFIG.topK);
+
+      // Historical Top (один и тот же для всех)
+      const historical = getTop10Historical();
+
+      // Отрисуем сравнение внизу
+      renderComparisonTables({ historical, baseline, deep });
+
+      // А в основном блоке покажем DL-рекомендации с жанрами
+      const withGenres = deep.map(r => ({
+        ...r,
+        genres: (ST.items.get(ST.revItem[r.i])?.genres || []).map((v,g) => v ? GENRES[g] : null).filter(Boolean)
+      }));
+      renderRecommendations(withGenres, rawUser);
+
+      setStatus(`Done. Shown top ${withGenres.length} for user ${rawUser}`);
     } catch (e) {
       console.error(e); setStatus(`Test error: ${e?.message || e}`);
     }
   };
 
+  // -------------------------- Helpers: user picker ----------------------------
+  function pickUserRaw(minPos = 5) {
+    for (let u = 0; u < ST.revUser.length; u++) {
+      if ((ST.userSeen.get(u)?.size || 0) >= minPos) return ST.revUser[u];
+    }
+    return ST.revUser[0];
+  }
+
   // Экспорт для дебага
-  window._tt = { ST, CONFIG, recommendForRawUser };
+  window._tt = { ST, CONFIG };
 
 })();
