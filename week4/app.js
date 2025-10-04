@@ -1,7 +1,12 @@
-// app.js — Two-Tower demo (TF.js) — fast train + 3 tables + robust PCA (power iteration)
+// app.js — Two-Tower demo (TF.js) — robust TF init, fast train, 3 tables, PCA on Test
 // -----------------------------------------------------------------------------
 (async function App() {
   'use strict';
+
+  // ------------------------------ Global error tap ----------------------------
+  window.addEventListener('error', (e) => {
+    console.error('[GlobalError]', e.message, e.filename, e.lineno, e.colno, e.error?.stack || '');
+  });
 
   // ------------------------------- Config ------------------------------------
   const CONFIG = {
@@ -28,8 +33,8 @@
 
     // Графики / PCA
     lossDrawEvery: 5,
-    pcaItems: 500,       // рисуем 500 айтемов
-    pcaPowerIters: 40,   // итераций степенного метода для каждого компонента
+    pcaItems: 500,       // 500 точек
+    pcaPowerIters: 40,   // итераций степенного метода
 
     // Исторический топ
     minRatingsForHistoricalTop: 50
@@ -86,6 +91,30 @@
 
   const setStatus = msg => (statusEl ? (statusEl.textContent = msg) : console.log('[status]', msg));
   const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  // --------------------------- Robust TF initialization -----------------------
+  async function ensureTF() {
+    if (typeof tf === 'undefined') {
+      throw new Error('TensorFlow.js not loaded. Include <script src="tf.min.js"></script> before scripts.');
+    }
+    // некоторые сборки бросают при tf.getBackend() до ready(); ловим и лечим
+    try {
+      await tf.ready();
+      const b = safeGetBackend();
+      if (!b) {
+        await tf.setBackend('cpu');
+        await tf.ready();
+      }
+    } catch (e) {
+      console.warn('[tf] backend init issue, forcing CPU:', e?.message || e);
+      await tf.setBackend('cpu');
+      await tf.ready();
+    }
+  }
+
+  function safeGetBackend() {
+    try { return tf.getBackend(); } catch { return null; }
+  }
 
   // ------------------------------ Data loading --------------------------------
   // u.item: movieId|title|...|g0..g18
@@ -260,10 +289,11 @@
   }
 
   async function train() {
+    await ensureTF();                 // <-- жёсткая инициализация TF
     if (!ST.model) { setStatus('Model is not initialized'); return; }
     if (!ST.positives.length) { setStatus('No positive pairs to train on'); return; }
-    await tf.ready();
-    setStatus('Training…');
+
+    setStatus(`Training… (backend: ${safeGetBackend() || 'unknown'})`);
 
     ST.lossHistory.length = 0;
     let batchCount = 0;
@@ -292,17 +322,12 @@
     setStatus('Training complete ✅');
     btnTest && (btnTest.disabled = false);
 
-    // безопасный PCA — после тренировки
-    try {
-      await drawItemPCA();
-    } catch (e) {
-      console.warn('PCA skipped:', e);
-      setStatus('Training complete (PCA skipped) ✅');
-    }
+    // ВАЖНО: PCA теперь НЕ в train(), чтобы «Training error» не зависел от визуализации
   }
 
   // ------------------------------ PCA (power iteration, 500 items) ------------
   async function drawItemPCA() {
+    await ensureTF();
     if (!pcaCanvas || !ST.model) return;
     if (!pcaCanvas.width || !pcaCanvas.height) { pcaCanvas.width = 640; pcaCanvas.height = 420; }
     const ctx = pcaCanvas.getContext('2d'), W = pcaCanvas.width, H = pcaCanvas.height;
@@ -325,14 +350,13 @@
     const Xc = X.sub(mean);                         // [N,D]
 
     // 3) Ковариация и степенной метод для топ-2 собственных векторов
-    //    Cov = Xc^T Xc  (D x D). Затем power iteration.
     const Cov = tf.matMul(Xc, Xc, true, false);     // [D,D]
 
     const v1 = await powerIteration(Cov, CONFIG.pcaPowerIters);      // [D,1]
-    const Cov_v1 = tf.matMul(Cov, v1);                               
+    const Cov_v1 = tf.matMul(Cov, v1);
     const l1 = tf.sum(tf.mul(v1, Cov_v1));                           // Rayleigh
 
-    // дефляция: Cov2 = Cov - λ1 v1 v1^T
+    // дефляция
     const v1T = v1.transpose();                                       // [1,D]
     const outer1 = tf.matMul(v1, v1T);                                // [D,D]
     const Cov2 = tf.sub(Cov, outer1.mul(l1));                         // [D,D]
@@ -414,6 +438,7 @@
 
   // --------- DL (two-tower): top-K по dot(u, items) ---------------------------
   async function getTopKDeep(uIdx, K = CONFIG.topK) {
+    await ensureTF();
     const seen = ST.userSeen.get(uIdx) || new Set();
     const { indices, scores } = await ST.model.getTopKForUser(uIdx, Math.min(ST.stats.nItems, Math.max(K*5, 200)));
     const out = [];
@@ -478,7 +503,7 @@
   if (btnLoad) btnLoad.onclick = async () => {
     try {
       setStatus('Loading data…');
-      await tf.ready();
+      await ensureTF();
       await Promise.all([loadItems(), loadRatings()]);
       buildMappingsAndAggregates();
       buildGenreMatrices();
@@ -506,6 +531,8 @@
   if (btnTest) btnTest.onclick = async () => {
     try {
       if (!ST.model) { setStatus('Train model first'); return; }
+      await ensureTF();
+
       // выберем юзера с приличной историей
       const rawUser = pickUserRaw(5);
       setStatus(`Scoring for user ${rawUser}…`);
@@ -531,7 +558,10 @@
       }));
       renderRecommendations(withGenres, rawUser);
 
-      setStatus(`Done. Shown top ${withGenres.length} for user ${rawUser}`);
+      // И только сейчас — PCA (чтобы тренировка никогда не падала из-за визуализации)
+      await drawItemPCA();
+
+      setStatus(`Done. Shown top ${withGenres.length} for user ${rawUser} (backend: ${safeGetBackend() || 'unknown'})`);
     } catch (e) {
       console.error(e); setStatus(`Test error: ${e?.message || e}`);
     }
@@ -546,6 +576,6 @@
   }
 
   // Экспорт для дебага
-  window._tt = { ST, CONFIG };
+  window._tt = { ST, CONFIG, ensureTF };
 
 })();
