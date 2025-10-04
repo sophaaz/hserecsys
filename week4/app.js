@@ -1,4 +1,4 @@
-// app.js — Two-Tower demo (TF.js) — fast train + 3 comparison tables + robust PCA
+// app.js — Two-Tower demo (TF.js) — fast train + 3 tables + robust PCA (power iteration)
 // -----------------------------------------------------------------------------
 (async function App() {
   'use strict';
@@ -9,11 +9,11 @@
     userHidden: 64,
     itemHidden: 64,
 
-    // Быстрее тренируем: BPR + меньше эпох + крупный батч
+    // Быстро и экономно
     learningRate: 0.003,
     l2: 1e-4,
     normalize: true,
-    lossType: 'bpr',     // 'bpr' быстрее, чем in-batch softmax
+    lossType: 'bpr',     // быстрее, чем in-batch softmax
 
     epochs: 6,
     batchSize: 2048,
@@ -28,9 +28,10 @@
 
     // Графики / PCA
     lossDrawEvery: 5,
-    pcaItems: 500,
+    pcaItems: 500,       // рисуем 500 айтемов
+    pcaPowerIters: 40,   // итераций степенного метода для каждого компонента
 
-    // Исторический топ – порог по количеству оценок
+    // Исторический топ
     minRatingsForHistoricalTop: 50
   };
 
@@ -228,7 +229,6 @@
   // ------------------------------ Training + charts ---------------------------
   function drawLoss() {
     if (!lossCanvas) return;
-    // если канвас без размеров — зададим
     if (!lossCanvas.width || !lossCanvas.height) { lossCanvas.width = 640; lossCanvas.height = 220; }
     const ctx = lossCanvas.getContext('2d');
     const W = lossCanvas.width, H = lossCanvas.height;
@@ -288,56 +288,63 @@
       console.log(`[epoch ${epoch}/${CONFIG.epochs}] mean loss = ${meanLoss.toFixed(5)}`);
     }
 
-    // финальный рендер графика
     drawLoss();
     setStatus('Training complete ✅');
     btnTest && (btnTest.disabled = false);
-    await drawItemPCA();
+
+    // безопасный PCA — после тренировки
+    try {
+      await drawItemPCA();
+    } catch (e) {
+      console.warn('PCA skipped:', e);
+      setStatus('Training complete (PCA skipped) ✅');
+    }
   }
 
-  // ------------------------------ PCA (500 items, robust) ---------------------
+  // ------------------------------ PCA (power iteration, 500 items) ------------
   async function drawItemPCA() {
     if (!pcaCanvas || !ST.model) return;
     if (!pcaCanvas.width || !pcaCanvas.height) { pcaCanvas.width = 640; pcaCanvas.height = 420; }
     const ctx = pcaCanvas.getContext('2d'), W = pcaCanvas.width, H = pcaCanvas.height;
     ctx.clearRect(0,0,W,H);
-    setStatus('Computing PCA (up to 500 items)…');
+    setStatus('Computing PCA (500 items)…');
 
-    // 1) Эмбеддинги айтемов + подвыборка
-    const I = await ST.model.materializeItemEmbeddings();
+    // 1) Эмбеддинги айтемов + равномерная подвыборка 500
+    const I = await ST.model.materializeItemEmbeddings(); // [M, D]
     const total = I.shape[0];
     const N = Math.min(CONFIG.pcaItems, total);
     if (N < 2) return; // нечего рисовать
+
     const idxArr = new Int32Array(N);
     for (let i=0;i<N;i++) idxArr[i] = Math.floor(i * total / N);
     const idx = tf.tensor1d(idxArr, 'int32');
     const X = tf.gather(I, idx);                    // [N, D]
 
-    // 2) Центрирование
+    // 2) Центрируем
     const mean = tf.mean(X, 0, true);               // [1,D]
     const Xc = X.sub(mean);                         // [N,D]
 
-    // 3) PCA: пытаемся через SVD, при ошибке — фолбэк на первые 2 оси
-    let pts;
-    try {
-      const svd = tf.svd ? tf.svd : null;
-      if (!svd) throw new Error('svd not available');
-      const { v } = tf.svd(Xc, true);               // v: [D,D]
-      const V2 = v.slice([0,0],[v.shape[0],2]);     // [D,2]
-      const proj = tf.matMul(Xc, V2);               // [N,2]
-      pts = await proj.array();
-      v.dispose(); V2.dispose(); proj.dispose();
-    } catch (e) {
-      // фолбэк: просто первые две координаты
-      const D = Xc.shape[1];
-      const take = Math.min(2, D);
-      const proj = Xc.slice([0,0],[N,take]).arraySync();
-      // если только одна ось — добавим нулевую вторую
-      if (take === 1) pts = proj.map(row => [row[0], 0]);
-      else pts = proj;
-    }
+    // 3) Ковариация и степенной метод для топ-2 собственных векторов
+    //    Cov = Xc^T Xc  (D x D). Затем power iteration.
+    const Cov = tf.matMul(Xc, Xc, true, false);     // [D,D]
 
-    // 4) Нормируем к канвасу и рисуем
+    const v1 = await powerIteration(Cov, CONFIG.pcaPowerIters);      // [D,1]
+    const Cov_v1 = tf.matMul(Cov, v1);                               
+    const l1 = tf.sum(tf.mul(v1, Cov_v1));                           // Rayleigh
+
+    // дефляция: Cov2 = Cov - λ1 v1 v1^T
+    const v1T = v1.transpose();                                       // [1,D]
+    const outer1 = tf.matMul(v1, v1T);                                // [D,D]
+    const Cov2 = tf.sub(Cov, outer1.mul(l1));                         // [D,D]
+
+    const v2 = await powerIteration(Cov2, CONFIG.pcaPowerIters);      // [D,1]
+
+    // 4) Проекция: Xc @ [v1, v2]  -> [N,2]
+    const V2 = tf.concat([v1, v2], 1);                                // [D,2]
+    const proj = tf.matMul(Xc, V2);                                   // [N,2]
+    const pts = await proj.array();
+
+    // 5) Нормируем к канвасу и рисуем
     const xs = pts.map(p=>p[0]), ys = pts.map(p=>p[1]);
     const xMin = Math.min(...xs), xMax = Math.max(...xs);
     const yMin = Math.min(...ys), yMax = Math.max(...ys);
@@ -350,13 +357,27 @@
       ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI*2); ctx.fill();
     }
     ctx.fillStyle = '#000'; ctx.font = '12px Arial';
-    ctx.fillText(`Item Embeddings projection • ${N} items`, 10, 18);
+    ctx.fillText(`Item Embeddings projection • ${N} items (PCA)`, 10, 18);
 
-    // 5) чистим временные тензоры
+    // 6) чистим временные тензоры
     idx.dispose(); X.dispose(); Xc.dispose(); mean.dispose();
+    Cov.dispose(); v1.dispose(); Cov_v1.dispose(); l1.dispose(); v1T.dispose(); outer1.dispose(); Cov2.dispose(); v2.dispose(); V2.dispose(); proj.dispose();
   }
 
-  // --------------------------- Historical Top 10 -------------------------------
+  // Power iteration: возвращает нормированный вектор столбец [D,1]
+  async function powerIteration(C, iters = 40) {
+    return tf.tidy(() => {
+      let v = tf.randomNormal([C.shape[0], 1]); // [D,1]
+      for (let t = 0; t < iters; t++) {
+        v = tf.matMul(C, v);                    // C v
+        const n = tf.norm(v).add(1e-8);
+        v = v.div(n);
+      }
+      return v;
+    });
+  }
+
+  // ------------------------------ Historical Top 10 ---------------------------
   function getTop10Historical() {
     const out = [];
     for (let i = 0; i < ST.stats.nItems; i++) {
@@ -373,12 +394,12 @@
 
   // --------- Baseline (без DL): контент-бейз по жанрам (косинус) --------------
   function getTopKContentBaseline(uIdx, K = CONFIG.topK) {
-    const uVec = ST.userGenresDense[uIdx]; // уже L2-норм
+    const uVec = ST.userGenresDense[uIdx]; // L2-норм
     const seen = ST.userSeen.get(uIdx) || new Set();
     const scores = [];
     for (let i = 0; i < ST.stats.nItems; i++) {
       if (seen.has(i)) continue;
-      const gi = ST.itemGenresDense[i]; // L2-норм → dot == cosine
+      const gi = ST.itemGenresDense[i];
       let s = 0;
       for (let g = 0; g < CONFIG.genreCount; g++) s += (uVec[g] * gi[g]);
       if (s > 0) {
@@ -464,7 +485,7 @@
       setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings}`);
       btnTrain && (btnTrain.disabled = false);
 
-      // Сразу покажем Historical Top 10 (для пустого сравнения)
+      // Сразу покажем Historical Top 10
       const historical = getTop10Historical();
       renderComparisonTables({ historical, baseline: [], deep: [] });
     } catch (e) {
@@ -489,20 +510,21 @@
       const rawUser = pickUserRaw(5);
       setStatus(`Scoring for user ${rawUser}…`);
 
-      // DL рекомендации
       const uIdx = ST.userMap.get(rawUser);
+
+      // DL рекомендации
       const deep = await getTopKDeep(uIdx, CONFIG.topK);
 
       // Baseline контент-бейз (без DL)
       const baseline = getTopKContentBaseline(uIdx, CONFIG.topK);
 
-      // Historical Top (один и тот же для всех)
+      // Historical Top
       const historical = getTop10Historical();
 
       // Отрисуем сравнение внизу
       renderComparisonTables({ historical, baseline, deep });
 
-      // А в основном блоке покажем DL-рекомендации с жанрами
+      // В основном блоке — DL + жанры
       const withGenres = deep.map(r => ({
         ...r,
         genres: (ST.items.get(ST.revItem[r.i])?.genres || []).map((v,g) => v ? GENRES[g] : null).filter(Boolean)
