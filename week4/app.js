@@ -1,5 +1,8 @@
-// app.js — Two-Tower demo (TF.js) — robust TF init, fast train, 3 tables, PCA on Test
+// app.js — Two-Tower demo (TF.js) — CPU backend fix, fast train, 3 tables, PCA on Test
 // -----------------------------------------------------------------------------
+// Ключ: жёстко форсим CPU-бэкенд TF.js, чтобы обойти падения WebGL ("Neg.js"/backend undefined).
+// -----------------------------------------------------------------------------
+
 (async function App() {
   'use strict';
 
@@ -92,23 +95,26 @@
   const setStatus = msg => (statusEl ? (statusEl.textContent = msg) : console.log('[status]', msg));
   const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-  // --------------------------- Robust TF initialization -----------------------
-  async function ensureTF() {
+  // --------------------------- Robust TF initialization (CPU) -----------------
+  let _backend = 'unknown';
+
+  async function ensureTF_CPU() {
     if (typeof tf === 'undefined') {
       throw new Error('TensorFlow.js not loaded. Include <script src="tf.min.js"></script> before scripts.');
     }
-    // некоторые сборки бросают при tf.getBackend() до ready(); ловим и лечим
+    // Жёстко перключаемся на CPU — это надёжно на любых машинах и сборках TF.js.
     try {
-      await tf.ready();
-      const b = safeGetBackend();
-      if (!b) {
+      // Если уже CPU — просто готовимся
+      if (safeGetBackend() !== 'cpu') {
         await tf.setBackend('cpu');
-        await tf.ready();
       }
+      await tf.ready();
+      _backend = safeGetBackend() || 'cpu';
     } catch (e) {
-      console.warn('[tf] backend init issue, forcing CPU:', e?.message || e);
+      console.warn('[tf] Forcing CPU backend fallback:', e?.message || e);
       await tf.setBackend('cpu');
       await tf.ready();
+      _backend = safeGetBackend() || 'cpu';
     }
   }
 
@@ -289,11 +295,11 @@
   }
 
   async function train() {
-    await ensureTF();                 // <-- жёсткая инициализация TF
+    await ensureTF_CPU();          // <-- Жёстко CPU до начала тренировки
     if (!ST.model) { setStatus('Model is not initialized'); return; }
     if (!ST.positives.length) { setStatus('No positive pairs to train on'); return; }
 
-    setStatus(`Training… (backend: ${safeGetBackend() || 'unknown'})`);
+    setStatus(`Training… (backend: ${_backend})`);
 
     ST.lossHistory.length = 0;
     let batchCount = 0;
@@ -309,7 +315,7 @@
 
         if (batchCount % CONFIG.lossDrawEvery === 0) {
           drawLoss();
-          setStatus(`Epoch ${epoch}/${CONFIG.epochs} — loss ~ ${(lossSum/count).toFixed(4)}`);
+          setStatus(`Epoch ${epoch}/${CONFIG.epochs} — loss ~ ${(lossSum/count).toFixed(4)} (backend: ${_backend})`);
           await tf.nextFrame();
         }
       }
@@ -322,17 +328,17 @@
     setStatus('Training complete ✅');
     btnTest && (btnTest.disabled = false);
 
-    // ВАЖНО: PCA теперь НЕ в train(), чтобы «Training error» не зависел от визуализации
+    // ВАЖНО: PCA НЕ внутри train(), чтобы "Training error" не зависел от визуализации
   }
 
   // ------------------------------ PCA (power iteration, 500 items) ------------
   async function drawItemPCA() {
-    await ensureTF();
+    await ensureTF_CPU();
     if (!pcaCanvas || !ST.model) return;
     if (!pcaCanvas.width || !pcaCanvas.height) { pcaCanvas.width = 640; pcaCanvas.height = 420; }
     const ctx = pcaCanvas.getContext('2d'), W = pcaCanvas.width, H = pcaCanvas.height;
     ctx.clearRect(0,0,W,H);
-    setStatus('Computing PCA (500 items)…');
+    setStatus(`Computing PCA (500 items)… (backend: ${_backend})`);
 
     // 1) Эмбеддинги айтемов + равномерная подвыборка 500
     const I = await ST.model.materializeItemEmbeddings(); // [M, D]
@@ -438,7 +444,7 @@
 
   // --------- DL (two-tower): top-K по dot(u, items) ---------------------------
   async function getTopKDeep(uIdx, K = CONFIG.topK) {
-    await ensureTF();
+    await ensureTF_CPU();
     const seen = ST.userSeen.get(uIdx) || new Set();
     const { indices, scores } = await ST.model.getTopKForUser(uIdx, Math.min(ST.stats.nItems, Math.max(K*5, 200)));
     const out = [];
@@ -503,11 +509,11 @@
   if (btnLoad) btnLoad.onclick = async () => {
     try {
       setStatus('Loading data…');
-      await ensureTF();
+      await ensureTF_CPU(); // CPU бэкенд инициализирован до любой математики
       await Promise.all([loadItems(), loadRatings()]);
       buildMappingsAndAggregates();
       buildGenreMatrices();
-      setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings}`);
+      setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings} (backend: ${_backend})`);
       btnTrain && (btnTrain.disabled = false);
 
       // Сразу покажем Historical Top 10
@@ -531,11 +537,11 @@
   if (btnTest) btnTest.onclick = async () => {
     try {
       if (!ST.model) { setStatus('Train model first'); return; }
-      await ensureTF();
+      await ensureTF_CPU();
 
       // выберем юзера с приличной историей
       const rawUser = pickUserRaw(5);
-      setStatus(`Scoring for user ${rawUser}…`);
+      setStatus(`Scoring for user ${rawUser}… (backend: ${_backend})`);
 
       const uIdx = ST.userMap.get(rawUser);
 
@@ -558,10 +564,10 @@
       }));
       renderRecommendations(withGenres, rawUser);
 
-      // И только сейчас — PCA (чтобы тренировка никогда не падала из-за визуализации)
+      // PCA после отрисовки таблиц
       await drawItemPCA();
 
-      setStatus(`Done. Shown top ${withGenres.length} for user ${rawUser} (backend: ${safeGetBackend() || 'unknown'})`);
+      setStatus(`Done. Shown top ${withGenres.length} for user ${rawUser} (backend: ${_backend})`);
     } catch (e) {
       console.error(e); setStatus(`Test error: ${e?.message || e}`);
     }
@@ -576,6 +582,6 @@
   }
 
   // Экспорт для дебага
-  window._tt = { ST, CONFIG, ensureTF };
+  window._tt = { ST, CONFIG, ensureTF_CPU };
 
 })();
