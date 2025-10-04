@@ -1,9 +1,9 @@
-// app.js — Two-Tower demo (TF.js) — стабильное обучение на CPU, UI-прогресс, 3 таблицы, PCA на 500
+// app.js — Two-Tower (TF.js) — stable CPU, SOFTMAX loss (no Neg), 3 tables, PCA(500)
 // -----------------------------------------------------------------------------
 (async function App() {
   'use strict';
 
-  // ------------------------------ Глобальный перехват ошибок ------------------
+  // ------------------------------ Global error tap ----------------------------
   window.addEventListener('error', (e) => {
     console.error('[GlobalError]', e.message, e.filename, e.lineno, e.colno, e.error?.stack || '');
   });
@@ -14,14 +14,15 @@
     userHidden: 64,
     itemHidden: 64,
 
-    // Базовые гиперы (будут авто-тюнинговаться под CPU)
-    learningRate: 0.003,
+    // Надёжные гиперы под CPU + softmax
+    learningRate: 0.002,
     l2: 1e-4,
     normalize: true,
-    lossType: 'bpr',     // быстрее и экономнее, чем in-batch softmax
+    lossType: 'softmax',   // ВАЖНО: без BPR -> не дергается Neg kernel
+    logitScale: 20,        // масштаб логитов для падения loss
 
-    epochs: 6,           // базово; на CPU уменьшаем
-    batchSize: 2048,     // базово; на CPU уменьшаем
+    epochs: 4,             // короче на CPU
+    batchSize: 512,        // умеренно, чтобы UI не фризил
 
     posThreshold: 4,
     topK: 10,
@@ -32,7 +33,7 @@
     },
 
     // Графики / PCA
-    lossDrawEvery: 3,    // чаще обновляем график, чтобы UI жил
+    lossDrawEvery: 2,
     pcaItems: 500,
     pcaPowerIters: 40,
 
@@ -42,24 +43,18 @@
 
   // ------------------------------- State -------------------------------------
   const ST = {
-    items: new Map(),            // rawItemId -> { title, year, genres[19] }
-    interactionsRaw: [],         // { userId, itemId, rating }
-
-    userMap: new Map(),          // rawUserId -> u
-    itemMap: new Map(),          // rawItemId -> i
-    revUser: [],                 // u -> rawUserId
-    revItem: [],                 // i -> rawItemId
-
-    positives: [],               // {u,i} (rating>=posThreshold)
-    userSeen: new Map(),         // u -> Set(i)
-
-    itemGenresDense: null,       // [I,19] L2-норм
-    userGenresDense: null,       // [U,19] L2-норм
-
-    // агрегаты для исторического топа
-    itemSum: null,               // Float32Array[I]
-    itemCnt: null,               // Uint32Array[I]
-
+    items: new Map(),
+    interactionsRaw: [],
+    userMap: new Map(),
+    itemMap: new Map(),
+    revUser: [],
+    revItem: [],
+    positives: [],
+    userSeen: new Map(),
+    itemGenresDense: null,
+    userGenresDense: null,
+    itemSum: null,
+    itemCnt: null,
     model: null,
     stats: { nUsers: 0, nItems: 0, nRatings: 0 },
     lossHistory: [],
@@ -92,29 +87,22 @@
   const setStatus = msg => (statusEl ? (statusEl.textContent = msg) : console.log('[status]', msg));
   const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-  // --------------------------- Инициализация TF: форс CPU ---------------------
+  // --------------------------- TF init: force CPU (no WebGL) ------------------
   async function ensureTF_CPU() {
     if (typeof tf === 'undefined') {
       throw new Error('TensorFlow.js не загружен. Подключите tf.min.js до app.js.');
     }
-    // Жёстко переключаемся на CPU, чтобы обойти крэши WebGL (Neg.js/backend undefined)
     try {
       await tf.setBackend('cpu');
       await tf.ready();
     } catch (e) {
       console.warn('[tf] setBackend(cpu) issue:', e?.message || e);
-      // даже если бросило — попробуем продолжить
       await tf.ready();
     }
-    try {
-      ST.backend = tf.getBackend();
-    } catch {
-      ST.backend = 'cpu';
-    }
+    try { ST.backend = tf.getBackend(); } catch { ST.backend = 'cpu'; }
   }
 
   // ------------------------------ Data loading --------------------------------
-  // u.item: movieId|title|...|g0..g18
   async function loadItems() {
     const res = await fetch(CONFIG.files.item);
     if (!res.ok) throw new Error(`Failed to fetch ${CONFIG.files.item}: ${res.status}`);
@@ -144,7 +132,6 @@
     }
   }
 
-  // u.data: userId\titemId\trating\ttimestamp
   async function loadRatings() {
     const res = await fetch(CONFIG.files.data);
     if (!res.ok) throw new Error(`Failed to fetch ${CONFIG.files.data}: ${res.status}`);
@@ -167,24 +154,16 @@
   }
 
   function buildMappingsAndAggregates() {
-    // users
-    {
-      const users = new Set(ST.interactionsRaw.map(x => x.userId));
-      let idx = 0;
-      for (const u of users) { ST.userMap.set(u, idx++); ST.revUser.push(u); }
-    }
-    // items
-    {
-      const items = Array.from(ST.items.keys()).sort((a,b)=>a-b);
-      let idx = 0;
-      for (const i of items) { ST.itemMap.set(i, idx++); ST.revItem.push(i); }
-    }
+    const users = new Set(ST.interactionsRaw.map(x => x.userId));
+    let idx = 0; for (const u of users) { ST.userMap.set(u, idx++); ST.revUser.push(u); }
+
+    const items = Array.from(ST.items.keys()).sort((a,b)=>a-b);
+    idx = 0; for (const i of items) { ST.itemMap.set(i, idx++); ST.revItem.push(i); }
 
     const I = ST.revItem.length;
     ST.itemSum = new Float32Array(I);
     ST.itemCnt = new Uint32Array(I);
 
-    // seen + positives + агрегаты по фильмам
     ST.userSeen.clear(); ST.positives.length = 0;
     for (const { userId, itemId, rating } of ST.interactionsRaw) {
       const u = ST.userMap.get(userId);
@@ -203,14 +182,13 @@
     ST.stats.nItems = ST.revItem.length;
     ST.stats.nRatings = ST.interactionsRaw.length;
 
-    // Если позитивов слишком мало (например, из-за sparsity) — ослабим порог до 3
+    // если позитивов совсем мало — ослабим порог до 3
     if (ST.positives.length < 1000) {
       ST.positives.length = 0;
       ST.userSeen.clear();
       for (const { userId, itemId, rating } of ST.interactionsRaw) {
         const u = ST.userMap.get(userId);
         const i = ST.itemMap.get(itemId);
-        if (u == null || i == null) continue;
         if (!ST.userSeen.has(u)) ST.userSeen.set(u, new Set());
         ST.userSeen.get(u).add(i);
         if (rating >= 3) ST.positives.push({ u, i });
@@ -246,10 +224,11 @@
   // ------------------------------ Model wiring --------------------------------
   function buildModel() {
     if (ST.model) { ST.model.dispose(); ST.model = null; }
+    // Передаём logitScale в модель (если поддерживает — ок; если нет — игнорируется)
     ST.model = new TwoTowerModel(
       ST.stats.nUsers, ST.stats.nItems, CONFIG.embDim,
       { lossType: CONFIG.lossType, lr: CONFIG.learningRate, userHidden: CONFIG.userHidden,
-        itemHidden: CONFIG.itemHidden, l2: CONFIG.l2, normalize: CONFIG.normalize }
+        itemHidden: CONFIG.itemHidden, l2: CONFIG.l2, normalize: CONFIG.normalize, logitScale: CONFIG.logitScale }
     );
     ST.model.setFeatures({ itemGenres: ST.itemGenresDense, userGenres: ST.userGenresDense });
   }
@@ -279,11 +258,9 @@
     const minV = Math.min(...ST.lossHistory);
     const range = (maxV - minV) || 1;
 
-    // оси
     ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(40,10); ctx.lineTo(40,H-30); ctx.lineTo(W-10,H-30); ctx.stroke();
 
-    // линия лосса
     ctx.strokeStyle = '#007acc'; ctx.lineWidth = 2; ctx.beginPath();
     ST.lossHistory.forEach((v, i) => {
       const x = 40 + (i/(ST.lossHistory.length-1))*(W-50);
@@ -292,69 +269,53 @@
     });
     ctx.stroke();
 
-    // подписи
     ctx.fillStyle = '#000'; ctx.font = '12px Arial';
     ctx.fillText(`min ${minV.toFixed(4)}`, 45, 14);
     ctx.fillText(`max ${maxV.toFixed(4)}`, 120, 14);
     ctx.fillText('batches →', W-90, H-12);
   }
 
-  function effectiveTrainParams() {
-    // Если CPU — уменьшаем вычислительную нагрузку
-    const isCPU = (ST.backend || 'cpu') === 'cpu';
-    return {
-      epochs: isCPU ? Math.min(4, CONFIG.epochs) : CONFIG.epochs,
-      batch:  isCPU ? Math.min(256, CONFIG.batchSize) : CONFIG.batchSize,
-      drawEvery: isCPU ? 1 : CONFIG.lossDrawEvery
-    };
-  }
-
   async function train() {
-    await ensureTF_CPU();          // <-- гарантируем CPU и готовность
+    await ensureTF_CPU();
     if (!ST.model) { setStatus('Model is not initialized'); return; }
     if (!ST.positives.length) { setStatus('No positive pairs to train on'); return; }
 
-    const { epochs, batch, drawEvery } = effectiveTrainParams();
-
-    // Блокируем кнопки на время тренировки
+    // Блокируем кнопки
     if (btnLoad)  btnLoad.disabled = true;
     if (btnTrain) btnTrain.disabled = true;
     if (btnTest)  btnTest.disabled = true;
 
-    setStatus(`Training… (backend: ${ST.backend}, epochs=${epochs}, batch=${batch})`);
+    setStatus(`Training… (backend: ${ST.backend})`);
 
     ST.lossHistory.length = 0;
     let batchCount = 0;
-
-    // Подсчитаем количество батчей (для прогресса)
-    const totalBatches = Math.ceil(ST.positives.length / batch) * epochs;
+    const totalBatches = Math.ceil(ST.positives.length / CONFIG.batchSize) * CONFIG.epochs;
     let doneBatches = 0;
 
-    for (let epoch = 1; epoch <= epochs; epoch++) {
+    for (let epoch = 1; epoch <= CONFIG.epochs; epoch++) {
       let lossSum = 0, count = 0;
 
-      for (const bt of batchIterator(ST.positives, batch)) {
-        const loss = await ST.model.trainStep(bt.users, bt.items);
+      for (const bt of batchIterator(ST.positives, CONFIG.batchSize)) {
+        const loss = await ST.model.trainStep(bt.users, bt.items); // softmax step — без Neg
         lossSum += loss * bt.size; count += bt.size;
         ST.lossHistory.push(loss);
         batchCount++; doneBatches++;
 
-        if (batchCount % drawEvery === 0) {
+        if (batchCount % CONFIG.lossDrawEvery === 0) {
           drawLoss();
           const pct = Math.round((doneBatches / totalBatches) * 100);
-          setStatus(`Epoch ${epoch}/${epochs} — loss ~ ${(lossSum/count).toFixed(4)} — ${pct}% (backend: ${ST.backend})`);
-          await tf.nextFrame(); // отдаём кадр UI
+          setStatus(`Epoch ${epoch}/${CONFIG.epochs} — loss ~ ${(lossSum/count).toFixed(4)} — ${pct}%`);
+          await tf.nextFrame();
         }
       }
 
       const meanLoss = lossSum / Math.max(1, count);
-      console.log(`[epoch ${epoch}/${epochs}] mean loss = ${meanLoss.toFixed(5)}`);
+      console.log(`[epoch ${epoch}/${CONFIG.epochs}] mean loss = ${meanLoss.toFixed(5)}`);
     }
 
     drawLoss();
     setStatus('Training complete ✅');
 
-    // Разблокируем кнопки
     if (btnLoad)  btnLoad.disabled = false;
     if (btnTrain) btnTrain.disabled = false;
     if (btnTest)  btnTest.disabled = false;
@@ -369,41 +330,35 @@
     ctx.clearRect(0,0,W,H);
     setStatus(`Computing PCA (500 items)… (backend: ${ST.backend})`);
 
-    // 1) Эмбеддинги айтемов + равномерная подвыборка 500
     const I = await ST.model.materializeItemEmbeddings(); // [M, D]
     const total = I.shape[0];
     const N = Math.min(CONFIG.pcaItems, total);
-    if (N < 2) return; // нечего рисовать
+    if (N < 2) return;
 
     const idxArr = new Int32Array(N);
     for (let i=0;i<N;i++) idxArr[i] = Math.floor(i * total / N);
     const idx = tf.tensor1d(idxArr, 'int32');
     const X = tf.gather(I, idx);                    // [N, D]
 
-    // 2) Центрирование
-    const mean = tf.mean(X, 0, true);               // [1,D]
+    const mean = tf.mean(X, 0, true);
     const Xc = X.sub(mean);                         // [N,D]
 
-    // 3) Ковариация и степенной метод для топ-2 собственных векторов
     const Cov = tf.matMul(Xc, Xc, true, false);     // [D,D]
 
-    const v1 = await powerIteration(Cov, CONFIG.pcaPowerIters);      // [D,1]
+    const v1 = await powerIteration(Cov, CONFIG.pcaPowerIters);
     const Cov_v1 = tf.matMul(Cov, v1);
-    const l1 = tf.sum(tf.mul(v1, Cov_v1));                           // Rayleigh
+    const l1 = tf.sum(tf.mul(v1, Cov_v1));
 
-    // дефляция
-    const v1T = v1.transpose();                                       // [1,D]
-    const outer1 = tf.matMul(v1, v1T);                                // [D,D]
-    const Cov2 = tf.sub(Cov, outer1.mul(l1));                         // [D,D]
+    const v1T = v1.transpose();
+    const outer1 = tf.matMul(v1, v1T);
+    const Cov2 = tf.sub(Cov, outer1.mul(l1));
 
-    const v2 = await powerIteration(Cov2, CONFIG.pcaPowerIters);      // [D,1]
+    const v2 = await powerIteration(Cov2, CONFIG.pcaPowerIters);
 
-    // 4) Проекция: Xc @ [v1, v2]  -> [N,2]
-    const V2 = tf.concat([v1, v2], 1);                                // [D,2]
-    const proj = tf.matMul(Xc, V2);                                   // [N,2]
+    const V2 = tf.concat([v1, v2], 1);              // [D,2]
+    const proj = tf.matMul(Xc, V2);                 // [N,2]
     const pts = await proj.array();
 
-    // 5) Нормируем к канвасу и рисуем
     const xs = pts.map(p=>p[0]), ys = pts.map(p=>p[1]);
     const xMin = Math.min(...xs), xMax = Math.max(...xs);
     const yMin = Math.min(...ys), yMax = Math.max(...ys);
@@ -418,17 +373,15 @@
     ctx.fillStyle = '#000'; ctx.font = '12px Arial';
     ctx.fillText(`Item Embeddings projection • ${N} items (PCA)`, 10, 18);
 
-    // 6) чистим временные тензоры
     idx.dispose(); X.dispose(); Xc.dispose(); mean.dispose();
     Cov.dispose(); v1.dispose(); Cov_v1.dispose(); l1.dispose(); v1T.dispose(); outer1.dispose(); Cov2.dispose(); v2.dispose(); V2.dispose(); proj.dispose();
   }
 
-  // Power iteration: нормированный вектор-столбец [D,1]
   async function powerIteration(C, iters = 40) {
     return tf.tidy(() => {
-      let v = tf.randomNormal([C.shape[0], 1]); // [D,1]
+      let v = tf.randomNormal([C.shape[0], 1]);
       for (let t = 0; t < iters; t++) {
-        v = tf.matMul(C, v);                    // C v
+        v = tf.matMul(C, v);
         const n = tf.norm(v).add(1e-8);
         v = v.div(n);
       }
@@ -538,14 +491,13 @@
   if (btnLoad) btnLoad.onclick = async () => {
     try {
       setStatus('Loading data…');
-      await ensureTF_CPU(); // CPU бэкенд инициализирован до любой математики
+      await ensureTF_CPU();
       await Promise.all([loadItems(), loadRatings()]);
       buildMappingsAndAggregates();
       buildGenreMatrices();
       setStatus(`Loaded. Users=${ST.stats.nUsers}, Items=${ST.stats.nItems}, Ratings=${ST.stats.nRatings} (backend: ${ST.backend})`);
       if (btnTrain) btnTrain.disabled = false;
 
-      // Сразу покажем Historical Top 10
       const historical = getTop10Historical();
       renderComparisonTables({ historical, baseline: [], deep: [] });
     } catch (e) {
@@ -570,32 +522,23 @@
       if (!ST.model) { setStatus('Train model first'); return; }
       await ensureTF_CPU();
 
-      // выберем юзера с приличной историей
       const rawUser = pickUserRaw(5);
       setStatus(`Scoring for user ${rawUser}… (backend: ${ST.backend})`);
 
       const uIdx = ST.userMap.get(rawUser);
 
-      // DL рекомендации
       const deep = await getTopKDeep(uIdx, CONFIG.topK);
-
-      // Baseline контент-бейз (без DL)
       const baseline = getTopKContentBaseline(uIdx, CONFIG.topK);
-
-      // Historical Top
       const historical = getTop10Historical();
 
-      // Отрисуем сравнение внизу
       renderComparisonTables({ historical, baseline, deep });
 
-      // В основном блоке — DL + жанры
       const withGenres = deep.map(r => ({
         ...r,
         genres: (ST.items.get(ST.revItem[r.i])?.genres || []).map((v,g) => v ? GENRES[g] : null).filter(Boolean)
       }));
       renderRecommendations(withGenres, rawUser);
 
-      // PCA после отрисовки таблиц
       await drawItemPCA();
 
       setStatus(`Done. Shown top ${withGenres.length} for user ${rawUser} (backend: ${ST.backend})`);
@@ -604,7 +547,6 @@
     }
   };
 
-  // -------------------------- Helpers: user picker ----------------------------
   function pickUserRaw(minPos = 5) {
     for (let u = 0; u < ST.revUser.length; u++) {
       if ((ST.userSeen.get(u)?.size || 0) >= minPos) return ST.revUser[u];
@@ -612,7 +554,6 @@
     return ST.revUser[0];
   }
 
-  // Экспорт для дебага
   window._tt = { ST, CONFIG, ensureTF_CPU };
 
 })();
